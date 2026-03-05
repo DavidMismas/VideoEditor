@@ -158,7 +158,16 @@ struct ActiveClipEditorView: View {
                         Rectangle().fill(Color.gray).frame(width: 10)
                     }
                     .padding()
-                    .overlay(Text(isolatedClip.mediaItem.name).font(.caption).foregroundColor(.white))
+                    .overlay(
+                        VStack(spacing: 2) {
+                            Text(isolatedClip.mediaItem.name)
+                            if let lutName = viewModel.lutName(for: isolatedClip.appliedLUTID) {
+                                Text("LUT: \(lutName)")
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundColor(.white)
+                    )
                     .contentShape(Rectangle()) // ensure the whole area is draggable
                     .draggable(isolatedClip.id.uuidString)
                 } else if let _ = viewModel.selectedClipId {
@@ -179,9 +188,17 @@ struct ActiveClipEditorView: View {
                         .foregroundColor(Theme.textSecondary)
                 }
             }
-            .dropDestination(for: String.self) { items, location in
-                guard let idString = items.first,
-                      let uuid = UUID(uuidString: idString),
+            .dropDestination(for: String.self) { items, _ in
+                guard let idString = items.first else { return false }
+                
+                if idString.hasPrefix("lut:"),
+                   let lutID = UUID(uuidString: String(idString.dropFirst(4))) {
+                    let targetClipID = viewModel.isolatedClip?.id ?? viewModel.selectedClipId
+                    guard let targetClipID else { return false }
+                    return viewModel.applyLUT(lutID, toClip: targetClipID)
+                }
+                
+                guard let uuid = UUID(uuidString: idString),
                       let item = viewModel.mediaLibrary.first(where: { $0.id == uuid }) else { return false }
                 
                 // Set the isolated item for the Middle view
@@ -262,8 +279,21 @@ struct WaveformView: View {
 // Bottom: Master Timeline
 struct MasterTimelineView: View {
     var viewModel: EditorViewModel
-    private let pixelsPerSecond: CGFloat = 72
+    @State private var timelineZoom: Double = 1.0
+    
+    private let basePixelsPerSecond: CGFloat = 72
     private let laneHeaderWidth: CGFloat = 44
+    private let minTimelineZoom: Double = 0.5
+    private let maxTimelineZoom: Double = 4.0
+    private let zoomStep: Double = 0.25
+    
+    private var pixelsPerSecond: CGFloat {
+        basePixelsPerSecond * CGFloat(timelineZoom)
+    }
+    
+    private var zoomLabel: String {
+        "\(Int((timelineZoom * 100).rounded()))%"
+    }
     
     private var timelineDuration: Double {
         let allTracks = viewModel.videoTracks + viewModel.audioTracks
@@ -279,11 +309,40 @@ struct MasterTimelineView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Movie Timeline")
-                .font(.caption)
-                .foregroundColor(Theme.textMain)
-                .padding(4)
-                .background(Theme.panelBackground.opacity(0.8))
+            HStack(spacing: 10) {
+                Text("Movie Timeline")
+                    .font(.caption)
+                    .foregroundColor(Theme.textMain)
+                
+                Spacer()
+                
+                HStack(spacing: 6) {
+                    Button(action: { changeZoom(by: -zoomStep) }) {
+                        Image(systemName: "minus.magnifyingglass")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(Theme.textSecondary)
+                    
+                    Slider(value: $timelineZoom, in: minTimelineZoom...maxTimelineZoom)
+                        .frame(width: 120)
+                        .tint(Theme.accentPink)
+                    
+                    Text(zoomLabel)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(Theme.textSecondary)
+                        .frame(width: 42, alignment: .trailing)
+                    
+                    Button(action: { changeZoom(by: zoomStep) }) {
+                        Image(systemName: "plus.magnifyingglass")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(Theme.textSecondary)
+                }
+            }
+            .padding(6)
+            .background(Theme.panelBackground.opacity(0.8))
             
             ScrollView(.horizontal) {
                 VStack(alignment: .leading, spacing: 4) {
@@ -302,9 +361,10 @@ struct MasterTimelineView: View {
                             pixelsPerSecond: pixelsPerSecond,
                             laneHeaderWidth: laneHeaderWidth,
                             isSelected: .constant(false),
+                            lutNameProvider: { viewModel.lutName(for: $0) },
                             selectionAction: { id in
                             viewModel.selectClip(id: id)
-                        }, dropStringAction: { idString, trackId in
+                        }, dropStringAction: { idString, trackId, _ in
                             if let uuid = UUID(uuidString: idString) {
                                 if let isolated = viewModel.isolatedClip, isolated.id == uuid {
                                     if track.isAudioOnly && isolated.mediaItem.type == .video { return }
@@ -327,8 +387,9 @@ struct MasterTimelineView: View {
                             pixelsPerSecond: pixelsPerSecond,
                             laneHeaderWidth: laneHeaderWidth,
                             isSelected: .constant(false),
+                            lutNameProvider: nil,
                             selectionAction: nil,
-                            dropStringAction: { idString, trackId in
+                            dropStringAction: { idString, trackId, _ in
                             if let uuid = UUID(uuidString: idString) {
                                 if let isolated = viewModel.isolatedClip, isolated.id == uuid {
                                     if track.isAudioOnly && isolated.mediaItem.type == .video { return }
@@ -372,6 +433,10 @@ struct MasterTimelineView: View {
         }
         return 5.0
     }
+    
+    private func changeZoom(by delta: Double) {
+        timelineZoom = min(max(timelineZoom + delta, minTimelineZoom), maxTimelineZoom)
+    }
 }
 
 struct TimelineTrackRow: View {
@@ -380,8 +445,9 @@ struct TimelineTrackRow: View {
     var pixelsPerSecond: CGFloat
     var laneHeaderWidth: CGFloat
     @Binding var isSelected: Bool
+    var lutNameProvider: ((UUID) -> String?)?
     var selectionAction: ((UUID) -> Void)?
-    var dropStringAction: ((String, UUID) -> Void)?
+    var dropStringAction: ((String, UUID, UUID?) -> Void)?
     
     @State private var isTargeted = false
     
@@ -417,6 +483,13 @@ struct TimelineTrackRow: View {
                                     Text(formatTime(clipDurationSeconds(clip)))
                                         .font(.caption2.monospacedDigit())
                                         .foregroundColor(.white.opacity(0.9))
+                                    if let lutID = clip.appliedLUTID,
+                                       let lutName = lutNameProvider?(lutID) {
+                                        Text("LUT: \(lutName)")
+                                            .font(.caption2)
+                                            .lineLimit(1)
+                                            .foregroundColor(.white.opacity(0.9))
+                                    }
                                 }
                                 .foregroundColor(.white)
                                 .padding(.horizontal, 6)
@@ -426,6 +499,11 @@ struct TimelineTrackRow: View {
                                 .border(Theme.backgroundDark, width: 1)
                                 .onTapGesture {
                                     selectionAction?(clip.id)
+                                }
+                                .dropDestination(for: String.self) { items, _ in
+                                    guard let idString = items.first, !idString.hasPrefix("lut:") else { return false }
+                                    dropStringAction?(idString, track.id, clip.id)
+                                    return true
                                 }
                         }
                         
@@ -438,8 +516,9 @@ struct TimelineTrackRow: View {
             }
             .frame(width: timelineWidth, alignment: .leading)
             .dropDestination(for: String.self) { items, location in
-                guard let idString = items.first else { return false }
-                dropStringAction?(idString, track.id)
+                guard let idString = items.first, !idString.hasPrefix("lut:") else { return false }
+                let targetClipId = clipID(at: location.x)
+                dropStringAction?(idString, track.id, targetClipId)
                 return true
             } isTargeted: { targeted in
                 isTargeted = targeted
@@ -471,6 +550,21 @@ struct TimelineTrackRow: View {
         let mins = total / 60
         let secs = total % 60
         return String(format: "%02d:%02d", mins, secs)
+    }
+    
+    private func clipID(at xPosition: CGFloat) -> UUID? {
+        guard !track.clips.isEmpty else { return nil }
+        
+        var cursor: CGFloat = 0
+        for clip in track.clips {
+            let width = clipWidth(clip)
+            if xPosition >= cursor, xPosition <= (cursor + width) {
+                return clip.id
+            }
+            cursor += width
+        }
+        
+        return nil
     }
 }
 

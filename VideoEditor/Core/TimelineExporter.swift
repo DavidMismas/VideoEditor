@@ -10,6 +10,7 @@ final class TimelineExporter {
     private struct ClipSegment {
         let timeRange: CMTimeRange
         let adjustments: ColorAdjustments
+        let lutURL: URL?
     }
     
     private init() {}
@@ -19,12 +20,15 @@ final class TimelineExporter {
         audioTracks: [TimelineTrack],
         config: ProjectConfig,
         format: ExportFormat,
-        destinationURL: URL
+        destinationURL: URL,
+        lutLibrary: [LUTItem] = [],
+        onProgress: (@MainActor @Sendable (Double) -> Void)? = nil
     ) async throws {
         let build = try await buildComposition(
             videoTracks: videoTracks,
             audioTracks: audioTracks,
-            config: config
+            config: config,
+            lutLibrary: lutLibrary
         )
         
         let presetCandidates = [format.preferredPreset] + format.fallbackPresets
@@ -50,12 +54,45 @@ final class TimelineExporter {
         exportSession.videoComposition = build.videoComposition
         exportSession.shouldOptimizeForNetworkUse = (format == .mp4 || format == .hevc)
         
+        if let onProgress {
+            onProgress(0)
+        }
+        let progressTask = Task { [exportSession] in
+            await self.monitorExportProgress(session: exportSession, onProgress: onProgress)
+        }
+        defer { progressTask.cancel() }
+        
         do {
             try await exportSession.export(to: destinationURL, as: fileType)
+            if let onProgress {
+                onProgress(1)
+            }
         } catch is CancellationError {
             throw TimelineExportError.exportCancelled
         } catch {
             throw TimelineExportError.exportFailed(error.localizedDescription)
+        }
+    }
+    
+    private func monitorExportProgress(
+        session: AVAssetExportSession,
+        onProgress: (@MainActor @Sendable (Double) -> Void)?
+    ) async {
+        guard let onProgress else { return }
+        
+        for await state in session.states(updateInterval: 0.1) {
+            if Task.isCancelled { break }
+            
+            switch state {
+            case .pending, .waiting:
+                onProgress(0)
+            case .exporting(let progress):
+                let raw = progress.fractionCompleted
+                let normalized = min(max(raw.isFinite ? raw : 0, 0), 1)
+                onProgress(normalized)
+            @unknown default:
+                break
+            }
         }
     }
     
@@ -80,7 +117,8 @@ final class TimelineExporter {
     private func buildComposition(
         videoTracks: [TimelineTrack],
         audioTracks: [TimelineTrack],
-        config: ProjectConfig
+        config: ProjectConfig,
+        lutLibrary: [LUTItem]
     ) async throws -> (composition: AVMutableComposition, videoComposition: AVVideoComposition, totalDuration: CMTime) {
         guard let primaryVideoTrack = videoTracks.first(where: { !$0.isAudioOnly && !$0.clips.isEmpty }) else {
             throw TimelineExportError.noVideoClips
@@ -104,6 +142,7 @@ final class TimelineExporter {
         var clipSegments: [ClipSegment] = []
         var timelineCursor = CMTime.zero
         var preferredTransformSet = false
+        let lutMap = Dictionary(uniqueKeysWithValues: lutLibrary.map { ($0.id, $0.url) })
         
         for clip in primaryVideoTrack.clips {
             guard let sourceURL = clip.mediaItem.url else {
@@ -142,7 +181,13 @@ final class TimelineExporter {
             }
             
             let segmentTimeRange = CMTimeRange(start: timelineCursor, duration: finalDuration)
-            clipSegments.append(ClipSegment(timeRange: segmentTimeRange, adjustments: clip.adjustments))
+            clipSegments.append(
+                ClipSegment(
+                    timeRange: segmentTimeRange,
+                    adjustments: clip.adjustments,
+                    lutURL: clip.appliedLUTID.flatMap { lutMap[$0] }
+                )
+            )
             timelineCursor = CMTimeAdd(timelineCursor, finalDuration)
         }
         
@@ -188,7 +233,7 @@ final class TimelineExporter {
         
         let videoComposition = try await AVVideoComposition(applyingFiltersTo: composition, applier: { params in
             let compositionTime = params.compositionTime
-            let clipAdjustments = clipMap.first(where: { segment in
+            let clipSegment = clipMap.first(where: { segment in
                 guard segment.timeRange.start.isNumeric,
                       segment.timeRange.duration.isNumeric,
                       segment.timeRange.duration > .zero,
@@ -199,8 +244,14 @@ final class TimelineExporter {
                 let start = segment.timeRange.start
                 let end = CMTimeAdd(start, segment.timeRange.duration)
                 return CMTimeCompare(compositionTime, start) >= 0 && CMTimeCompare(compositionTime, end) < 0
-            })?.adjustments ?? defaultAdjustments
-            let filtered = exportProcessor.applyAdjustments(clipAdjustments, to: params.sourceImage)
+            })
+            let clipAdjustments = clipSegment?.adjustments ?? defaultAdjustments
+            let clipLUTURL = clipSegment?.lutURL
+            let filtered = exportProcessor.applyAdjustments(
+                clipAdjustments,
+                lutURL: clipLUTURL,
+                to: params.sourceImage
+            )
             return AVCIImageFilteringResult(resultImage: filtered)
         })
 

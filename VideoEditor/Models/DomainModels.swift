@@ -22,6 +22,12 @@ struct MediaItem: Identifiable, Hashable, Codable, Transferable {
     }
 }
 
+struct LUTItem: Identifiable, Hashable {
+    var id: UUID = UUID()
+    var name: String
+    var url: URL
+}
+
 nonisolated struct HSLControl: Equatable {
     var hue: Double = 0.0 // -1 to 1 (adjustment)
     var saturation: Double = 1.0 // 0 to 2 (multiplier)
@@ -56,11 +62,14 @@ nonisolated struct ColorAdjustments: Equatable {
     var blueHSL = HSLControl()
     var purpleHSL = HSLControl()
     var magentaHSL = HSLControl()
+    var hslTightness: Double = 0.50
     
     // Color Grading
     var globalTint = ColorWheelControl()
     var shadowTint = ColorWheelControl()
     var highlightTint = ColorWheelControl()
+    var shadowRange: Double = 0.45
+    var highlightRange: Double = 0.90
     
     // Effects
     var vignette: Double = 0

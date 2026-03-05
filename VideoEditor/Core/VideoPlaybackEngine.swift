@@ -3,6 +3,28 @@ import AVFoundation
 import CoreImage
 import Observation
 
+nonisolated private final class AdjustmentSnapshotStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = ProcessingSnapshot()
+    
+    func set(_ newValue: ProcessingSnapshot) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+    
+    func get() -> ProcessingSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+nonisolated private struct ProcessingSnapshot {
+    var adjustments: ColorAdjustments = ColorAdjustments()
+    var lutURL: URL? = nil
+}
+
 @Observable
 class VideoPlaybackEngine {
     var player: AVPlayer = AVPlayer()
@@ -12,15 +34,19 @@ class VideoPlaybackEngine {
     // Custom video compositor reference
     private var videoComposition: AVVideoComposition?
     private var timeObserverToken: Any?
-    private let compositorStateQueue = DispatchQueue(label: "VideoPlaybackEngine.compositorState")
-    private var compositorAdjustments = ColorAdjustments()
+    private let adjustmentsStore = AdjustmentSnapshotStore()
     
     // We store the current adjustments to apply during playback
     var currentAdjustments: ColorAdjustments = ColorAdjustments() {
         didSet {
-            compositorStateQueue.sync {
-                compositorAdjustments = currentAdjustments
-            }
+            updateSnapshotStore()
+            refreshCurrentFrameIfNeeded()
+        }
+    }
+    
+    var currentLUTURL: URL? {
+        didSet {
+            updateSnapshotStore()
             refreshCurrentFrameIfNeeded()
         }
     }
@@ -46,42 +72,35 @@ class VideoPlaybackEngine {
                 let durationSeconds = max(mediaDuration.seconds, 0)
                 
                 let item = AVPlayerItem(asset: asset)
+                let composition = try await makeVideoComposition(for: asset)
                 
                 // Set up the custom video compositor
-                setupVideoComposition(for: asset, on: item)
-                
-                DispatchQueue.main.async {
-                    self.player.replaceCurrentItem(with: item)
-                    self.duration = durationSeconds
-                    self.currentTime = 0
-                    self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
-                }
+                self.videoComposition = composition
+                item.videoComposition = composition
+                self.player.replaceCurrentItem(with: item)
+                self.duration = durationSeconds
+                self.currentTime = 0
+                await self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
             } catch {
                 print("Failed to load asset: \(error)")
             }
         }
     }
     
-    private func setupVideoComposition(for asset: AVAsset, on item: AVPlayerItem) {
-        // We use AVVideoComposition to intercept frames and apply CoreImage filters
-        let filterInstruction = AVMutableVideoComposition(asset: asset, applyingCIFiltersWithHandler: { [weak self] request in
-            guard let self = self else {
-                request.finish(with: request.sourceImage, context: nil)
-                return
-            }
-            
-            let adjustmentsSnapshot = self.compositorStateQueue.sync {
-                self.compositorAdjustments
-            }
-            
-            // Apply our CoreImage Processor logic
-            let filteredImage = CoreImageProcessor.shared.applyAdjustments(adjustmentsSnapshot, to: request.sourceImage)
-            
-            request.finish(with: filteredImage, context: nil)
-        })
+    private func makeVideoComposition(for asset: AVAsset) async throws -> AVVideoComposition {
+        let adjustmentsStore = self.adjustmentsStore
         
-        self.videoComposition = filterInstruction
-        item.videoComposition = filterInstruction
+        // We use AVVideoComposition to intercept frames and apply CoreImage filters
+        return try await AVVideoComposition(applyingFiltersTo: asset, applier: { params in
+            let processingSnapshot = adjustmentsStore.get()
+            // Apply our CoreImage Processor logic
+            let filteredImage = CoreImageProcessor.shared.applyAdjustments(
+                processingSnapshot.adjustments,
+                lutURL: processingSnapshot.lutURL,
+                to: params.sourceImage
+            )
+            return AVCIImageFilteringResult(resultImage: filteredImage)
+        })
     }
     
     func togglePlayPause() {
@@ -144,6 +163,15 @@ class VideoPlaybackEngine {
                 self.duration = max(currentItem.duration.seconds, 0)
             }
         }
+    }
+    
+    private func updateSnapshotStore() {
+        adjustmentsStore.set(
+            ProcessingSnapshot(
+                adjustments: currentAdjustments,
+                lutURL: currentLUTURL
+            )
+        )
     }
 }
 

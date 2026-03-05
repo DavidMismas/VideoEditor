@@ -69,7 +69,19 @@ nonisolated class LUTGenerator {
             adjustments.purpleHSL,
             adjustments.magentaHSL
         ]
-        let influenceRadius: Double = 0.20
+        let tightness = clamp(adjustments.hslTightness, min: 0.20, max: 1.0)
+        let looseness = 1.0 - tightness
+        let hueRadius: Double = 0.095 + (0.105 * looseness)
+        let saturationRadius: Double = 0.090 + (0.095 * looseness)
+        // Luminance remains the most selective control, but less restrictive than before.
+        let luminanceRadius: Double = 0.042 + (0.060 * looseness)
+        let hueExponent: Double = 2.4 + (tightness * 1.7)
+        let saturationExponent: Double = 2.2 + (tightness * 1.6)
+        let luminanceExponent: Double = 3.4 + (tightness * 2.4)
+        // Global gain so all HSL sliders feel stronger without changing UI ranges.
+        let hueStrength: Double = 1.28
+        let saturationStrength: Double = 1.32
+        let luminanceStrength: Double = 1.26
 
         for b in 0..<dimension {
             let blue = Double(b) / Double(dimension - 1)
@@ -82,39 +94,79 @@ nonisolated class LUTGenerator {
                     let hsl = rgbToHSL(working)
                     var hue = hsl.h
                     var sat = hsl.s
-                    var lum = hsl.l
+                    let lum = hsl.l
+                    let maxChannel = max(working.red, max(working.green, working.blue))
+                    let minChannel = min(working.red, min(working.green, working.blue))
+                    let absoluteChroma = maxChannel - minChannel
+                    let chromaGate = smoothstep(edge0: 0.015, edge1: 0.20, x: absoluteChroma)
+                    let lumChromaGate = smoothstep(edge0: 0.04, edge1: 0.24, x: absoluteChroma)
+                    let shadowGuard = smoothstep(edge0: 0.02, edge1: 0.10, x: lum)
+                    let highlightGuard = 1.0 - smoothstep(edge0: 0.95, edge1: 0.995, x: lum)
+                    let luminanceToneGate = clamp(shadowGuard * highlightGuard, min: 0.0, max: 1.0)
 
-                    var weightedHueShift = 0.0
-                    var weightedSatDelta = 0.0
-                    var weightedLumDelta = 0.0
-                    var totalWeight = 0.0
+                    var hueWeightedSum = 0.0
+                    var hueWeightTotal = 0.0
+                    var satWeightedSum = 0.0
+                    var satWeightTotal = 0.0
+                    var lumWeightedAccum = 0.0
+                    var lumWeightTotal = 0.0
 
                     for idx in 0..<channelCenters.count {
                         let center = channelCenters[idx]
                         let control = channelControls[idx]
                         let distance = circularDistance(hue, center)
-                        guard distance < influenceRadius else { continue }
-
-                        let normalized = 1.0 - (distance / influenceRadius)
-                        let weight = normalized * normalized * (3.0 - (2.0 * normalized))
-                        totalWeight += weight
-                        weightedHueShift += weight * control.hue
-                        weightedSatDelta += weight * (control.saturation - 1.0)
-                        weightedLumDelta += weight * control.luminance
+                        
+                        if abs(control.hue) > 0.0001 {
+                            let weight = localWeight(distance: distance, radius: hueRadius, exponent: hueExponent)
+                            if weight > 0 {
+                                hueWeightedSum += weight * control.hue
+                                hueWeightTotal += weight
+                            }
+                        }
+                        
+                        let satDelta = control.saturation - 1.0
+                        if abs(satDelta) > 0.0001 {
+                            let weight = localWeight(distance: distance, radius: saturationRadius, exponent: saturationExponent)
+                            if weight > 0 {
+                                satWeightedSum += weight * satDelta
+                                satWeightTotal += weight
+                            }
+                        }
+                        
+                        if abs(control.luminance) > 0.0001 {
+                            let weight = localWeight(distance: distance, radius: luminanceRadius, exponent: luminanceExponent)
+                            if weight > 0 {
+                                lumWeightedAccum += weight * control.luminance
+                                lumWeightTotal += weight
+                            }
+                        }
                     }
 
-                    if totalWeight > 0.0001 {
-                        let normalizedHueShift = weightedHueShift / totalWeight
-                        let normalizedSatDelta = weightedSatDelta / totalWeight
-                        let normalizedLumDelta = weightedLumDelta / totalWeight
-
+                    if hueWeightTotal > 0.0001 {
+                        let normalizedHueShift = hueWeightedSum / hueWeightTotal
+                        let hueInfluence = pow(clamp(hueWeightTotal, min: 0.0, max: 1.0), 0.75)
                         // Slider -1...1 maps to ~+-60deg shift for the selected hue family.
-                        hue = wrapUnit(hue + (normalizedHueShift * 0.1666))
-                        sat = clamp(sat + normalizedSatDelta, min: 0.0, max: 1.0)
-                        lum = clamp(lum + (normalizedLumDelta * 0.50), min: 0.0, max: 1.0)
+                        hue = wrapUnit(hue + ((normalizedHueShift * 0.185 * hueStrength) * chromaGate * hueInfluence))
+                    }
+                    
+                    if satWeightTotal > 0.0001 {
+                        let normalizedSatDelta = satWeightedSum / satWeightTotal
+                        let satInfluence = pow(clamp(satWeightTotal, min: 0.0, max: 1.0), 0.80)
+                        sat = clamp(sat + (normalizedSatDelta * 1.15 * saturationStrength * chromaGate * satInfluence), min: 0.0, max: 1.0)
                     }
 
                     working = hslToRGB(h: hue, s: sat, l: lum)
+                    if lumWeightTotal > 0.0001 {
+                        // Apply HSL luminance as selective brightness gain in RGB space.
+                        // This keeps hue stable and prevents adding selected hue into dark neutrals.
+                        let normalizedLumDelta = clamp(lumWeightedAccum / lumWeightTotal, min: -1.0, max: 1.0)
+                        let hueInfluenceForLum = pow(clamp(lumWeightTotal, min: 0.0, max: 1.0), 0.95)
+                        let luminanceMask = pow(lumChromaGate * luminanceToneGate * hueInfluenceForLum, 0.85)
+                        let gain = pow(2.0, normalizedLumDelta * 0.78 * luminanceStrength * luminanceMask)
+                        working.red = clamp(working.red * gain, min: 0.0, max: 1.0)
+                        working.green = clamp(working.green * gain, min: 0.0, max: 1.0)
+                        working.blue = clamp(working.blue * gain, min: 0.0, max: 1.0)
+                    }
                     working = applyColorGrading(working, adjustments: adjustments)
 
                     let dataOffset = ((b * dimension * dimension) + (g * dimension) + r) * 4
@@ -140,13 +192,19 @@ nonisolated class LUTGenerator {
         let luma = output.luma
 
         if adjustments.shadowTint.intensity > 0.0001 {
-            let shadowMask = 1.0 - smoothstep(edge0: 0.10, edge1: 0.65, x: luma)
+            // Keep shadow tint focused on darker tones with less midtone spill.
+            let shadowEdge1 = clamp(adjustments.shadowRange, min: 0.20, max: 0.70)
+            let shadowEdge0 = max(0.01, shadowEdge1 * 0.12)
+            let shadowMaskBase = 1.0 - smoothstep(edge0: shadowEdge0, edge1: shadowEdge1, x: luma)
+            let shadowMask = pow(shadowMaskBase, 1.35)
             let shadowTintRGB = colorWheelToRGB(adjustments.shadowTint)
-            output = mix(output, shadowTintRGB, factor: adjustments.shadowTint.intensity * 0.35 * shadowMask)
+            output = mix(output, shadowTintRGB, factor: adjustments.shadowTint.intensity * 0.32 * shadowMask)
         }
 
         if adjustments.highlightTint.intensity > 0.0001 {
-            let highlightMask = smoothstep(edge0: 0.35, edge1: 0.90, x: luma)
+            let highlightEdge1 = clamp(adjustments.highlightRange, min: 0.55, max: 0.98)
+            let highlightEdge0 = min(highlightEdge1 - 0.08, max(0.20, highlightEdge1 * 0.42))
+            let highlightMask = smoothstep(edge0: highlightEdge0, edge1: highlightEdge1, x: luma)
             let highlightTintRGB = colorWheelToRGB(adjustments.highlightTint)
             output = mix(output, highlightTintRGB, factor: adjustments.highlightTint.intensity * 0.35 * highlightMask)
         }
@@ -225,6 +283,12 @@ nonisolated class LUTGenerator {
     private func smoothstep(edge0: Double, edge1: Double, x: Double) -> Double {
         let t = clamp((x - edge0) / (edge1 - edge0), min: 0.0, max: 1.0)
         return t * t * (3.0 - (2.0 * t))
+    }
+    
+    private func localWeight(distance: Double, radius: Double, exponent: Double) -> Double {
+        guard radius > 0, distance < radius else { return 0 }
+        let normalized = 1.0 - (distance / radius)
+        return pow(max(0, normalized), exponent)
     }
 
     private func mix(_ a: RGB, _ b: RGB, factor: Double) -> RGB {

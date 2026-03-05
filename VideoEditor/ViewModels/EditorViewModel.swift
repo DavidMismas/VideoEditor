@@ -14,6 +14,7 @@ class EditorViewModel {
     
     // Library
     var mediaLibrary: [MediaItem] = []
+    var importedLUTs: [LUTItem] = []
     
     // Timeline
     var videoTracks: [TimelineTrack] = [TimelineTrack(name: "V1", clips: [])]
@@ -28,6 +29,7 @@ class EditorViewModel {
             guard let isolated = isolatedClip else {
                 if oldValue != nil {
                     engine.currentAdjustments = ColorAdjustments()
+                    engine.currentLUTURL = nil
                 }
                 return
             }
@@ -40,6 +42,7 @@ class EditorViewModel {
             }
             
             engine.currentAdjustments = isolated.adjustments
+            engine.currentLUTURL = lutURL(for: isolated.appliedLUTID)
         }
     }
     
@@ -92,6 +95,26 @@ class EditorViewModel {
         }
     }
     
+    @discardableResult
+    func importLUT(url: URL) -> Bool {
+        let normalizedURL = url.standardizedFileURL
+        
+        if importedLUTs.contains(where: { $0.url.standardizedFileURL == normalizedURL }) {
+            return true
+        }
+        
+        guard ImportedLUTManager.shared.hasValidCube(at: normalizedURL) else {
+            return false
+        }
+        
+        let item = LUTItem(
+            name: normalizedURL.deletingPathExtension().lastPathComponent,
+            url: normalizedURL
+        )
+        importedLUTs.append(item)
+        return true
+    }
+    
     func addExistingClip(clip: TimelineClip, toTrack trackId: UUID) {
         // Search in video tracks
         if let idx = videoTracks.firstIndex(where: { $0.id == trackId }) {
@@ -139,10 +162,17 @@ class EditorViewModel {
     
     func selectClip(id: UUID?) {
         selectedClipId = id
-        if let id = id, let clip = findClip(id: id), let url = clip.mediaItem.url {
-            engine.loadMedia(from: url)
-            engine.currentAdjustments = clip.adjustments
+        guard let id = id, let clip = findClip(id: id), let url = clip.mediaItem.url else {
+            if id == nil {
+                engine.currentAdjustments = ColorAdjustments()
+                engine.currentLUTURL = nil
+            }
+            return
         }
+        
+        engine.loadMedia(from: url)
+        engine.currentAdjustments = clip.adjustments
+        engine.currentLUTURL = lutURL(for: clip.appliedLUTID)
     }
     
     func updateAdjustments(for id: UUID?, _ newAdjustments: ColorAdjustments) {
@@ -167,13 +197,59 @@ class EditorViewModel {
         return nil
     }
     
-    func exportBottomTimeline(to outputURL: URL, format: ExportFormat) async throws {
+    @discardableResult
+    func applyLUT(_ lutID: UUID, toClip clipID: UUID) -> Bool {
+        guard let lut = importedLUTs.first(where: { $0.id == lutID }) else {
+            return false
+        }
+        
+        for trackIndex in videoTracks.indices {
+            if let clipIndex = videoTracks[trackIndex].clips.firstIndex(where: { $0.id == clipID }) {
+                videoTracks[trackIndex].clips[clipIndex].appliedLUTID = lutID
+                
+                if selectedClipId == clipID {
+                    engine.currentLUTURL = lut.url
+                }
+                if isolatedClip?.id == clipID {
+                    isolatedClip?.appliedLUTID = lutID
+                    engine.currentLUTURL = lut.url
+                }
+                return true
+            }
+        }
+        
+        if isolatedClip?.id == clipID {
+            isolatedClip?.appliedLUTID = lutID
+            engine.currentLUTURL = lut.url
+            return true
+        }
+        
+        return false
+    }
+    
+    func lutName(for id: UUID?) -> String? {
+        guard let id else { return nil }
+        return importedLUTs.first(where: { $0.id == id })?.name
+    }
+    
+    func lutURL(for id: UUID?) -> URL? {
+        guard let id else { return nil }
+        return importedLUTs.first(where: { $0.id == id })?.url
+    }
+    
+    func exportBottomTimeline(
+        to outputURL: URL,
+        format: ExportFormat,
+        onProgress: (@MainActor @Sendable (Double) -> Void)? = nil
+    ) async throws {
         try await TimelineExporter.shared.export(
             videoTracks: videoTracks,
             audioTracks: audioTracks,
             config: config,
             format: format,
-            destinationURL: outputURL
+            destinationURL: outputURL,
+            lutLibrary: importedLUTs,
+            onProgress: onProgress
         )
     }
     

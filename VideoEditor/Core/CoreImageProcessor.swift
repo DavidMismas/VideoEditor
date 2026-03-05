@@ -21,9 +21,15 @@ nonisolated class CoreImageProcessor {
     private let blurFilter = CIFilter(name: "CIGaussianBlur")
     private let processingQueue = DispatchQueue(label: "CoreImageProcessor.processingQueue")
     
-    func applyAdjustments(_ adjustments: ColorAdjustments, to image: CIImage) -> CIImage {
+    func applyAdjustments(_ adjustments: ColorAdjustments, lutURL: URL? = nil, to image: CIImage) -> CIImage {
         processingQueue.sync {
             var currentImage = image
+            
+            // 0. Optional imported camera/display LUT (e.g. LOG -> Rec.709 conversion).
+            if let lutURL,
+               let out = ImportedLUTManager.shared.applyCube(at: lutURL, to: currentImage) {
+                currentImage = out
+            }
             
             // 1. Exposure
             if adjustments.exposure != 0 {
