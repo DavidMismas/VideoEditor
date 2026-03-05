@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct InspectorView: View {
     @Bindable var viewModel: EditorViewModel
@@ -59,7 +60,7 @@ struct BasicAdjustmentsSection: View {
         DisclosureGroup(isExpanded: $isExpanded) {
             VStack(spacing: 12) {
                 SliderRow(title: "Exposure", value: $adjustments.exposure, range: -5...5)
-                SliderRow(title: "Contrast", value: $adjustments.contrast, range: -1...3)
+                SliderRow(title: "Contrast", value: $adjustments.contrast, range: 0.7...1.3)
                 SliderRow(title: "Highlights", value: $adjustments.highlights, range: -2...2)
                 SliderRow(title: "Shadows", value: $adjustments.shadows, range: -2...2)
             }
@@ -97,7 +98,7 @@ struct BasicColorSection: View {
         DisclosureGroup(isExpanded: $isExpanded) {
             VStack(spacing: 12) {
                 SliderRow(title: "Saturation", value: $adjustments.saturation, range: 0...2)
-                SliderRow(title: "Luminance", value: $adjustments.luminance, range: -1...1)
+                SliderRow(title: "Vibrance", value: $adjustments.vibrance, range: -1...1)
             }
             .padding(.top, 8)
         } label: {
@@ -116,6 +117,23 @@ struct TrueHSLSection: View {
         case red = "Red", orange = "Orange", yellow = "Yellow", green = "Green"
         case aqua = "Aqua", blue = "Blue", purple = "Purple", magenta = "Magenta"
         var id: String { self.rawValue }
+        
+        var baseHue: Double {
+            switch self {
+            case .red: return 0.0
+            case .orange: return 1.0 / 12.0
+            case .yellow: return 1.0 / 6.0
+            case .green: return 1.0 / 3.0
+            case .aqua: return 0.5
+            case .blue: return 2.0 / 3.0
+            case .purple: return 0.75
+            case .magenta: return 5.0 / 6.0
+            }
+        }
+        
+        var accentColor: Color {
+            Color(hue: baseHue, saturation: 0.95, brightness: 0.95)
+        }
     }
     
     var body: some View {
@@ -129,7 +147,7 @@ struct TrueHSLSection: View {
                 .pickerStyle(.menu)
                 .labelsHidden()
                 
-                HSLControlView(hsl: binding(for: selectedColor))
+                HSLControlView(hsl: binding(for: selectedColor), channel: selectedColor)
             }
             .padding(.top, 8)
         } label: {
@@ -167,12 +185,79 @@ struct TrueHSLSection: View {
 
 struct HSLControlView: View {
     @Binding var hsl: HSLControl
+    var channel: TrueHSLSection.HSLColorChannel
+    
+    private var hueGradient: LinearGradient {
+        let h = channel.baseHue
+        return LinearGradient(
+            colors: [
+                colorAtHue(h - 0.18),
+                colorAtHue(h - 0.09),
+                colorAtHue(h),
+                colorAtHue(h + 0.09),
+                colorAtHue(h + 0.18)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+    
+    private var saturationGradient: LinearGradient {
+        let h = channel.baseHue
+        return LinearGradient(
+            colors: [
+                Color(hue: h, saturation: 0.02, brightness: 0.55),
+                Color(hue: h, saturation: 0.55, brightness: 0.75),
+                Color(hue: h, saturation: 1.0, brightness: 0.95)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+    
+    private var luminanceGradient: LinearGradient {
+        let h = channel.baseHue
+        return LinearGradient(
+            colors: [
+                Color(hue: h, saturation: 1.0, brightness: 0.10),
+                Color(hue: h, saturation: 0.95, brightness: 0.55),
+                Color(hue: h, saturation: 0.30, brightness: 1.0)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+    
     var body: some View {
         VStack(spacing: 12) {
-            HueSliderRow(title: "Hue Shift", value: $hsl.hue, range: -1...1)
-            SliderRow(title: "Saturation", value: $hsl.saturation, range: 0...2)
-            SliderRow(title: "Luminance", value: $hsl.luminance, range: -1...1)
+            ColorizedSliderRow(
+                title: "Hue Shift",
+                value: $hsl.hue,
+                range: -1...1,
+                gradient: hueGradient,
+                tint: channel.accentColor
+            )
+            ColorizedSliderRow(
+                title: "Saturation",
+                value: $hsl.saturation,
+                range: 0...2,
+                gradient: saturationGradient,
+                tint: channel.accentColor
+            )
+            ColorizedSliderRow(
+                title: "Luminance",
+                value: $hsl.luminance,
+                range: -1...1,
+                gradient: luminanceGradient,
+                tint: channel.accentColor
+            )
         }
+    }
+    
+    private func colorAtHue(_ hue: Double) -> Color {
+        var wrapped = hue.truncatingRemainder(dividingBy: 1.0)
+        if wrapped < 0 { wrapped += 1.0 }
+        return Color(hue: wrapped, saturation: 0.95, brightness: 0.95)
     }
 }
 
@@ -227,32 +312,50 @@ struct EffectsSection: View {
     }
 }
 
+@MainActor
 struct ExportSection: View {
     var viewModel: EditorViewModel
     @State private var isExpanded: Bool = false
+    @State private var isExporting: Bool = false
+    @State private var exportMessageTitle: String = "Export"
+    @State private var exportMessageBody: String = ""
+    @State private var showExportAlert: Bool = false
     
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Format").foregroundColor(Theme.textSecondary)
-                Picker("", selection: .constant("mp4")) {
-                    Text("MP4 (H.264)").tag("mp4")
-                    Text("HEVC (H.265)").tag("hevc")
-                    Text("MOV (ProRes)").tag("mov")
+                Picker(
+                    "",
+                    selection: Binding(
+                        get: { viewModel.exportFormat },
+                        set: { viewModel.exportFormat = $0 }
+                    )
+                ) {
+                    ForEach(ExportFormat.allCases) { format in
+                        Text(format.displayName).tag(format)
+                    }
                 }
                 .pickerStyle(.menu)
                 .labelsHidden()
                 
-                Button(action: {
-                    print("Export clicked")
-                }) {
-                    Text("Export Video")
+                Button(action: startExportFlow) {
+                    HStack(spacing: 8) {
+                        if isExporting {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.black)
+                        }
+                        Text(isExporting ? "Exporting..." : "Export Video")
+                    }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
                         .background(Theme.accentGreen)
                         .foregroundColor(.black)
                         .cornerRadius(8)
                 }
+                .disabled(isExporting)
+                .opacity(isExporting ? 0.75 : 1.0)
                 .buttonStyle(.plain)
                 .padding(.top, 8)
             }
@@ -261,6 +364,84 @@ struct ExportSection: View {
             Text("Export").bold().foregroundColor(Theme.textMain)
         }
         .tint(Theme.accentPink)
+        .alert(exportMessageTitle, isPresented: $showExportAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(exportMessageBody)
+        }
+    }
+    
+    private func startExportFlow() {
+        guard !isExporting else { return }
+        
+        let selectedFormat = viewModel.exportFormat
+        guard let destinationURL = presentSavePanel(for: selectedFormat) else {
+            return
+        }
+        
+        isExporting = true
+        Task {
+            do {
+                try await viewModel.exportBottomTimeline(to: destinationURL, format: selectedFormat)
+                exportMessageTitle = "Export Complete"
+                exportMessageBody = "Video saved to:\n\(destinationURL.path)"
+                showExportAlert = true
+            } catch {
+                exportMessageTitle = "Export Failed"
+                exportMessageBody = error.localizedDescription
+                showExportAlert = true
+            }
+            isExporting = false
+        }
+    }
+    
+    private func presentSavePanel(for format: ExportFormat) -> URL? {
+        if !Thread.isMainThread {
+            return DispatchQueue.main.sync {
+                presentSavePanel(for: format)
+            }
+        }
+        
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [format.contentType]
+        panel.nameFieldStringValue = "TimelineExport.\(format.preferredExtension)"
+        panel.title = "Export Video"
+        panel.prompt = "Export"
+        
+        guard panel.runModal() == .OK, var url = panel.url else {
+            return nil
+        }
+        
+        if url.pathExtension.isEmpty {
+            url.appendPathExtension(format.preferredExtension)
+        }
+        return url
+    }
+}
+
+struct ColorizedSliderRow: View {
+    var title: String
+    @Binding var value: Double
+    var range: ClosedRange<Double>
+    var gradient: LinearGradient
+    var tint: Color
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                    .foregroundColor(Theme.textSecondary)
+                    .font(.caption)
+                Spacer()
+                Text(String(format: "%.2f", value))
+                    .foregroundColor(tint)
+                    .font(.caption.monospacedDigit())
+            }
+            Slider(value: $value, in: range)
+                .tint(tint)
+                .background(gradient.opacity(0.75).cornerRadius(4))
+        }
     }
 }
 

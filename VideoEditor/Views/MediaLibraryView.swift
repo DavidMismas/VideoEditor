@@ -101,7 +101,7 @@ struct MediaLibraryView: View {
     }
     
     private func forceIsolate(_ item: MediaItem) {
-        viewModel.isolatedClip = TimelineClip(mediaItem: item, startTime: .zero, duration: CMTime(seconds: 5, preferredTimescale: 600))
+        viewModel.isolatedClip = viewModel.makeTimelineClip(from: item)
         viewModel.selectedClipId = nil
     }
     

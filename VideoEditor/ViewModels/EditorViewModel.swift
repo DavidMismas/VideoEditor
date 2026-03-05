@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import CoreMedia
+import AVFoundation
 import Observation
 
 @Observable
@@ -66,12 +67,29 @@ class EditorViewModel {
     var currentTime: CMTime = .zero
     var isPlaying: Bool = false
     
+    // Export
+    var exportFormat: ExportFormat = .mp4
+    
+    private let fallbackClipDurationSeconds: Double = 5.0
+    
     // MARK: - Intents
     
     func importMedia(url: URL, type: MediaItem.MediaType) {
         let name = url.lastPathComponent
         let item = MediaItem(name: name, url: url, type: type)
         mediaLibrary.append(item)
+        
+        let itemID = item.id
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            guard let seconds = await Self.loadMediaDurationSeconds(for: url, type: type) else { return }
+            
+            await MainActor.run {
+                guard let idx = self.mediaLibrary.firstIndex(where: { $0.id == itemID }) else { return }
+                self.mediaLibrary[idx].durationSeconds = seconds
+                self.refreshClipDurations(for: itemID, loadedDurationSeconds: seconds)
+            }
+        }
     }
     
     func addExistingClip(clip: TimelineClip, toTrack trackId: UUID) {
@@ -87,8 +105,17 @@ class EditorViewModel {
         }
     }
     
-    func addClip(item: MediaItem, toTrack trackId: UUID) {
-        let newClip = TimelineClip(mediaItem: item, startTime: .zero, duration: CMTime(seconds: 5, preferredTimescale: 600))
+    func addClip(item: MediaItem, toTrack trackId: UUID) async {
+        var newClip = makeTimelineClip(from: item)
+        
+        if shouldReplaceClipDuration(newClip.duration),
+           let url = item.url,
+           let loadedSeconds = await Self.loadMediaDurationSeconds(for: url, type: item.type) {
+            newClip.duration = CMTime(seconds: loadedSeconds, preferredTimescale: 600)
+            if let idx = mediaLibrary.firstIndex(where: { $0.id == item.id }) {
+                mediaLibrary[idx].durationSeconds = loadedSeconds
+            }
+        }
         
         // Search in video tracks
         if let idx = videoTracks.firstIndex(where: { $0.id == trackId }) {
@@ -100,6 +127,14 @@ class EditorViewModel {
             audioTracks[idx].clips.append(newClip)
             return
         }
+    }
+    
+    func makeTimelineClip(from item: MediaItem) -> TimelineClip {
+        TimelineClip(
+            mediaItem: item,
+            startTime: .zero,
+            duration: resolvedClipDuration(for: item)
+        )
     }
     
     func selectClip(id: UUID?) {
@@ -130,5 +165,73 @@ class EditorViewModel {
             }
         }
         return nil
+    }
+    
+    func exportBottomTimeline(to outputURL: URL, format: ExportFormat) async throws {
+        try await TimelineExporter.shared.export(
+            videoTracks: videoTracks,
+            audioTracks: audioTracks,
+            config: config,
+            format: format,
+            destinationURL: outputURL
+        )
+    }
+    
+    private func resolvedClipDuration(for item: MediaItem) -> CMTime {
+        if let seconds = item.durationSeconds, seconds.isFinite, seconds > 0 {
+            return CMTime(seconds: seconds, preferredTimescale: 600)
+        }
+        
+        return CMTime(seconds: fallbackClipDurationSeconds, preferredTimescale: 600)
+    }
+    
+    private func refreshClipDurations(for mediaItemID: UUID, loadedDurationSeconds: Double) {
+        guard loadedDurationSeconds.isFinite, loadedDurationSeconds > 0 else { return }
+        let loadedDuration = CMTime(seconds: loadedDurationSeconds, preferredTimescale: 600)
+        
+        for trackIndex in videoTracks.indices {
+            for clipIndex in videoTracks[trackIndex].clips.indices where videoTracks[trackIndex].clips[clipIndex].mediaItem.id == mediaItemID {
+                let current = videoTracks[trackIndex].clips[clipIndex].duration
+                if shouldReplaceClipDuration(current) {
+                    videoTracks[trackIndex].clips[clipIndex].duration = loadedDuration
+                }
+            }
+        }
+        
+        for trackIndex in audioTracks.indices {
+            for clipIndex in audioTracks[trackIndex].clips.indices where audioTracks[trackIndex].clips[clipIndex].mediaItem.id == mediaItemID {
+                let current = audioTracks[trackIndex].clips[clipIndex].duration
+                if shouldReplaceClipDuration(current) {
+                    audioTracks[trackIndex].clips[clipIndex].duration = loadedDuration
+                }
+            }
+        }
+        
+        if var isolated = isolatedClip, isolated.mediaItem.id == mediaItemID, shouldReplaceClipDuration(isolated.duration) {
+            isolated.duration = loadedDuration
+            isolatedClip = isolated
+        }
+    }
+    
+    private func shouldReplaceClipDuration(_ duration: CMTime) -> Bool {
+        guard duration.isNumeric else { return true }
+        let seconds = duration.seconds
+        guard seconds.isFinite, seconds > 0 else { return true }
+        return abs(seconds - fallbackClipDurationSeconds) < 0.001
+    }
+    
+    private nonisolated static func loadMediaDurationSeconds(for url: URL, type: MediaItem.MediaType) async -> Double? {
+        guard type != .image else { return nil }
+        
+        let asset = AVURLAsset(url: url)
+        do {
+            let duration = try await asset.load(.duration)
+            guard duration.isNumeric else { return nil }
+            let seconds = duration.seconds
+            guard seconds.isFinite, seconds > 0 else { return nil }
+            return seconds
+        } catch {
+            return nil
+        }
     }
 }

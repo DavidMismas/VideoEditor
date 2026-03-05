@@ -185,7 +185,7 @@ struct ActiveClipEditorView: View {
                       let item = viewModel.mediaLibrary.first(where: { $0.id == uuid }) else { return false }
                 
                 // Set the isolated item for the Middle view
-                viewModel.isolatedClip = TimelineClip(mediaItem: item, startTime: .zero, duration: CMTime(seconds: 5, preferredTimescale: 600))
+                viewModel.isolatedClip = viewModel.makeTimelineClip(from: item)
                 
                 // Clear selected track clip if isolating a raw item
                 viewModel.selectedClipId = nil
@@ -262,6 +262,20 @@ struct WaveformView: View {
 // Bottom: Master Timeline
 struct MasterTimelineView: View {
     var viewModel: EditorViewModel
+    private let pixelsPerSecond: CGFloat = 72
+    private let laneHeaderWidth: CGFloat = 44
+    
+    private var timelineDuration: Double {
+        let allTracks = viewModel.videoTracks + viewModel.audioTracks
+        let longestTrack = allTracks
+            .map { trackDuration($0) }
+            .max() ?? 0
+        return max(longestTrack, 1)
+    }
+    
+    private var timelineWidth: CGFloat {
+        max(CGFloat(timelineDuration) * pixelsPerSecond, 800)
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -272,11 +286,23 @@ struct MasterTimelineView: View {
                 .background(Theme.panelBackground.opacity(0.8))
             
             ScrollView(.horizontal) {
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 4) {
+                    TimelineRulerView(
+                        duration: timelineDuration,
+                        width: timelineWidth,
+                        pixelsPerSecond: pixelsPerSecond,
+                        laneHeaderWidth: laneHeaderWidth
+                    )
                     
                     // Video Tracks
                     ForEach(viewModel.videoTracks) { track in
-                        TimelineTrackRow(track: track, isSelected: .constant(false), selectionAction: { id in
+                        TimelineTrackRow(
+                            track: track,
+                            timelineWidth: timelineWidth,
+                            pixelsPerSecond: pixelsPerSecond,
+                            laneHeaderWidth: laneHeaderWidth,
+                            isSelected: .constant(false),
+                            selectionAction: { id in
                             viewModel.selectClip(id: id)
                         }, dropStringAction: { idString, trackId in
                             if let uuid = UUID(uuidString: idString) {
@@ -285,7 +311,9 @@ struct MasterTimelineView: View {
                                     viewModel.addExistingClip(clip: isolated, toTrack: trackId)
                                 } else if let item = viewModel.mediaLibrary.first(where: { $0.id == uuid }) {
                                     if track.isAudioOnly && item.type == .video { return }
-                                    viewModel.addClip(item: item, toTrack: trackId)
+                                    Task {
+                                        await viewModel.addClip(item: item, toTrack: trackId)
+                                    }
                                 }
                             }
                         })
@@ -293,14 +321,23 @@ struct MasterTimelineView: View {
                     
                     // Audio Tracks
                     ForEach(viewModel.audioTracks) { track in
-                        TimelineTrackRow(track: track, isSelected: .constant(false), selectionAction: nil, dropStringAction: { idString, trackId in
+                        TimelineTrackRow(
+                            track: track,
+                            timelineWidth: timelineWidth,
+                            pixelsPerSecond: pixelsPerSecond,
+                            laneHeaderWidth: laneHeaderWidth,
+                            isSelected: .constant(false),
+                            selectionAction: nil,
+                            dropStringAction: { idString, trackId in
                             if let uuid = UUID(uuidString: idString) {
                                 if let isolated = viewModel.isolatedClip, isolated.id == uuid {
                                     if track.isAudioOnly && isolated.mediaItem.type == .video { return }
                                     viewModel.addExistingClip(clip: isolated, toTrack: trackId)
                                 } else if let item = viewModel.mediaLibrary.first(where: { $0.id == uuid }) {
                                     if track.isAudioOnly && item.type == .video { return }
-                                    viewModel.addClip(item: item, toTrack: trackId)
+                                    Task {
+                                        await viewModel.addClip(item: item, toTrack: trackId)
+                                    }
                                 }
                             }
                         })
@@ -319,10 +356,29 @@ struct MasterTimelineView: View {
             .background(Color(white: 0.12))
         }
     }
+    
+    private func trackDuration(_ track: TimelineTrack) -> Double {
+        track.clips.reduce(0) { partial, clip in
+            partial + clipDurationSeconds(clip)
+        }
+    }
+    
+    private func clipDurationSeconds(_ clip: TimelineClip) -> Double {
+        if clip.duration.isNumeric, clip.duration.seconds.isFinite, clip.duration.seconds > 0 {
+            return clip.duration.seconds
+        }
+        if let libraryDuration = clip.mediaItem.durationSeconds, libraryDuration.isFinite, libraryDuration > 0 {
+            return libraryDuration
+        }
+        return 5.0
+    }
 }
 
 struct TimelineTrackRow: View {
     var track: TimelineTrack
+    var timelineWidth: CGFloat
+    var pixelsPerSecond: CGFloat
+    var laneHeaderWidth: CGFloat
     @Binding var isSelected: Bool
     var selectionAction: ((UUID) -> Void)?
     var dropStringAction: ((String, UUID) -> Void)?
@@ -334,7 +390,7 @@ struct TimelineTrackRow: View {
             Text(track.name)
                 .font(.caption)
                 .foregroundColor(Theme.textSecondary)
-                .frame(width: 40, alignment: .leading)
+                .frame(width: laneHeaderWidth, alignment: .leading)
             
             ZStack(alignment: .leading) {
                 Rectangle()
@@ -351,19 +407,36 @@ struct TimelineTrackRow: View {
                 } else {
                     HStack(spacing: 0) {
                         ForEach(track.clips) { clip in
-                            Rectangle()
+                            ZStack(alignment: .bottomLeading) {
+                                Rectangle()
                                 .fill(track.isAudioOnly ? Theme.accentGreen : Theme.accentPink)
-                                .frame(width: 150) // Fake duration
-                                .overlay(Text(clip.mediaItem.name).font(.caption2).foregroundColor(.white))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(clip.mediaItem.name)
+                                        .font(.caption2.weight(.semibold))
+                                        .lineLimit(1)
+                                    Text(formatTime(clipDurationSeconds(clip)))
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundColor(.white.opacity(0.9))
+                                }
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 4)
+                            }
+                                .frame(width: clipWidth(clip))
                                 .border(Theme.backgroundDark, width: 1)
                                 .onTapGesture {
                                     selectionAction?(clip.id)
                                 }
                         }
+                        
+                        let fillWidth = max(timelineWidth - usedTrackWidth, 0)
+                        if fillWidth > 0 {
+                            Color.clear.frame(width: fillWidth)
+                        }
                     }
-                    .padding(.leading, 10)
                 }
             }
+            .frame(width: timelineWidth, alignment: .leading)
             .dropDestination(for: String.self) { items, location in
                 guard let idString = items.first else { return false }
                 dropStringAction?(idString, track.id)
@@ -372,5 +445,74 @@ struct TimelineTrackRow: View {
                 isTargeted = targeted
             }
         }
+    }
+    
+    private var usedTrackWidth: CGFloat {
+        track.clips.reduce(0) { $0 + clipWidth($1) }
+    }
+    
+    private func clipWidth(_ clip: TimelineClip) -> CGFloat {
+        max(CGFloat(clipDurationSeconds(clip)) * pixelsPerSecond, 56)
+    }
+    
+    private func clipDurationSeconds(_ clip: TimelineClip) -> Double {
+        if clip.duration.isNumeric, clip.duration.seconds.isFinite, clip.duration.seconds > 0 {
+            return clip.duration.seconds
+        }
+        if let libraryDuration = clip.mediaItem.durationSeconds, libraryDuration.isFinite, libraryDuration > 0 {
+            return libraryDuration
+        }
+        return 5.0
+    }
+    
+    private func formatTime(_ seconds: Double) -> String {
+        let clamped = max(0, seconds)
+        let total = Int(clamped.rounded(.down))
+        let mins = total / 60
+        let secs = total % 60
+        return String(format: "%02d:%02d", mins, secs)
+    }
+}
+
+struct TimelineRulerView: View {
+    var duration: Double
+    var width: CGFloat
+    var pixelsPerSecond: CGFloat
+    var laneHeaderWidth: CGFloat
+    
+    var body: some View {
+        HStack(spacing: 0) {
+            Color.clear.frame(width: laneHeaderWidth)
+            
+            ZStack(alignment: .topLeading) {
+                Rectangle()
+                    .fill(Theme.panelBackground.opacity(0.85))
+                    .frame(height: 24)
+                
+                ForEach(0...max(Int(ceil(duration)), 1), id: \.self) { second in
+                    let x = CGFloat(second) * pixelsPerSecond
+                    
+                    Path { path in
+                        path.move(to: CGPoint(x: x, y: 10))
+                        path.addLine(to: CGPoint(x: x, y: 24))
+                    }
+                    .stroke(Theme.separator.opacity(0.9), lineWidth: 1)
+                    
+                    if second % 2 == 0 {
+                        Text(formatTime(second))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundColor(Theme.textSecondary)
+                            .position(x: x + 16, y: 7)
+                    }
+                }
+            }
+            .frame(width: width, height: 24, alignment: .leading)
+        }
+    }
+    
+    private func formatTime(_ seconds: Int) -> String {
+        let mins = seconds / 60
+        let secs = seconds % 60
+        return String(format: "%02d:%02d", mins, secs)
     }
 }

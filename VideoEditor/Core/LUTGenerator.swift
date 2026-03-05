@@ -1,7 +1,7 @@
 import Foundation
 import CoreImage
 
-class LUTGenerator {
+nonisolated class LUTGenerator {
     static let shared = LUTGenerator()
     
     // Size of the 3D LUT (a standard size for video is 33x33x33, but 17 is faster for live preview)
@@ -10,28 +10,31 @@ class LUTGenerator {
     // We cache the generated filter to avoid re-calculating the 3D math on every frame if adjustments haven't changed
     private var cachedAdjustments: ColorAdjustments?
     private var cachedFilter: CIFilter?
+    private let cacheQueue = DispatchQueue(label: "LUTGenerator.cacheQueue")
     
     func filter(for adjustments: ColorAdjustments) -> CIFilter? {
-        // If settings haven't changed since last gen, return cached
-        if cachedAdjustments == adjustments, let cached = cachedFilter {
-            return cached
-        }
-
-        if !hasHSLOrGradingEdits(in: adjustments) {
+        cacheQueue.sync {
+            // If settings haven't changed since last gen, return cached
+            if cachedAdjustments == adjustments, let cached = cachedFilter {
+                return cached
+            }
+            
+            if !hasHSLOrGradingEdits(in: adjustments) {
+                cachedAdjustments = adjustments
+                cachedFilter = nil
+                return nil
+            }
+            
+            let cubeData = generateCubeData(for: adjustments)
+            let cubeFilter = CIFilter(name: "CIColorCube")
+            cubeFilter?.setValue(dimension, forKey: "inputCubeDimension")
+            cubeFilter?.setValue(cubeData, forKey: "inputCubeData")
+            cubeFilter?.setValue(false, forKey: "inputExtrapolate")
+            
             cachedAdjustments = adjustments
-            cachedFilter = nil
-            return nil
+            cachedFilter = cubeFilter
+            return cubeFilter
         }
-
-        let cubeData = generateCubeData(for: adjustments)
-        let cubeFilter = CIFilter(name: "CIColorCube")
-        cubeFilter?.setValue(dimension, forKey: "inputCubeDimension")
-        cubeFilter?.setValue(cubeData, forKey: "inputCubeData")
-        cubeFilter?.setValue(false, forKey: "inputExtrapolate")
-
-        cachedAdjustments = adjustments
-        cachedFilter = cubeFilter
-        return cubeFilter
     }
 
     private func hasHSLOrGradingEdits(in adjustments: ColorAdjustments) -> Bool {
@@ -244,7 +247,7 @@ class LUTGenerator {
     }
 }
 
-private struct RGB {
+nonisolated private struct RGB {
     var red: Double
     var green: Double
     var blue: Double
