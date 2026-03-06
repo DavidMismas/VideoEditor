@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import UniformTypeIdentifiers
+import CoreGraphics
 
 enum ExportFormat: String, CaseIterable, Identifiable {
     case mp4
@@ -13,7 +14,7 @@ enum ExportFormat: String, CaseIterable, Identifiable {
         switch self {
         case .mp4: return "MP4 (H.264)"
         case .hevc: return "HEVC (H.265)"
-        case .mov: return "MOV (ProRes)"
+        case .mov: return "MOV (H.264)"
         }
     }
     
@@ -38,35 +39,83 @@ enum ExportFormat: String, CaseIterable, Identifiable {
         case .hevc, .mov: return .mov
         }
     }
-    
-    var preferredPreset: String {
+
+    var videoCodec: AVVideoCodecType {
         switch self {
-        case .mp4:
-            return AVAssetExportPresetHighestQuality
+        case .mp4, .mov:
+            return .h264
         case .hevc:
-            return AVAssetExportPresetHEVCHighestQuality
-        case .mov:
-            return AVAssetExportPresetAppleProRes422LPCM
+            return .hevc
         }
     }
-    
-    var fallbackPresets: [String] {
+}
+
+enum ExportQuality: String, CaseIterable, Identifiable {
+    case low
+    case medium
+    case high
+
+    var id: String { rawValue }
+
+    var displayName: String {
         switch self {
-        case .mp4:
-            return [AVAssetExportPreset1920x1080, AVAssetExportPresetHighestQuality]
-        case .hevc:
-            return [AVAssetExportPresetHighestQuality]
-        case .mov:
-            return [AVAssetExportPresetHighestQuality]
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
         }
     }
-    
-    // Preconfigured target used by format selection (for future AVAssetWriter tuning).
-    var targetBitrate: Int {
+
+    func targetBitrate(for format: ExportFormat) -> Int {
         switch self {
-        case .mp4: return 12_000_000
-        case .hevc: return 8_000_000
-        case .mov: return 40_000_000
+        case .low:
+            switch format {
+            case .hevc: return 60_000_000
+            case .mp4, .mov: return 80_000_000
+            }
+        case .medium:
+            switch format {
+            case .hevc: return 100_000_000
+            case .mp4, .mov: return 120_000_000
+            }
+        case .high:
+            switch format {
+            case .hevc: return 140_000_000
+            case .mp4, .mov: return 180_000_000
+            }
+        }
+    }
+}
+
+enum ExportFrameRate: Int, CaseIterable, Identifiable {
+    case fps30 = 30
+    case fps60 = 60
+
+    var id: Int { rawValue }
+
+    var displayName: String {
+        "\(rawValue) fps"
+    }
+}
+
+enum ExportResolution: String, CaseIterable, Identifiable {
+    case fullHD
+    case uhd4k
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .fullHD: return "1080p (1920x1080)"
+        case .uhd4k: return "4K UHD (3840x2160)"
+        }
+    }
+
+    var size: CGSize {
+        switch self {
+        case .fullHD:
+            return CGSize(width: 1920, height: 1080)
+        case .uhd4k:
+            return CGSize(width: 3840, height: 2160)
         }
     }
 }
@@ -75,8 +124,8 @@ enum TimelineExportError: LocalizedError {
     case noVideoClips
     case clipMissingURL(String)
     case unableToCreateCompositionTrack
-    case unsupportedPreset
-    case unableToCreateExportSession
+    case unableToCreateReader
+    case unableToCreateWriter
     case exportCancelled
     case exportFailed(String)
     
@@ -88,10 +137,10 @@ enum TimelineExportError: LocalizedError {
             return "Clip '\(clipName)' has no valid source URL."
         case .unableToCreateCompositionTrack:
             return "Unable to create composition tracks for export."
-        case .unsupportedPreset:
-            return "Selected export format is not supported for this timeline."
-        case .unableToCreateExportSession:
-            return "Unable to initialize export session."
+        case .unableToCreateReader:
+            return "Unable to initialize asset reader for export."
+        case .unableToCreateWriter:
+            return "Unable to initialize asset writer for export."
         case .exportCancelled:
             return "Export was cancelled."
         case .exportFailed(let reason):

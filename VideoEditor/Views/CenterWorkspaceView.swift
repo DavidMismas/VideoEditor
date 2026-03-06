@@ -1,22 +1,49 @@
 import SwiftUI
 import CoreMedia
+import AppKit
 
 struct CenterWorkspaceView: View {
     @Bindable var viewModel: EditorViewModel
+    
+    private var hasActiveClip: Bool {
+        viewModel.isolatedClip != nil || viewModel.selectedClipId != nil
+    }
     
     var body: some View {
         VSplitView {
             // Top: Live Preview
             LivePreviewView(viewModel: viewModel)
-                .frame(minHeight: 200)
+                .frame(minHeight: 320, idealHeight: 440)
             
             // Middle: Active Clip Timeline
             ActiveClipEditorView(viewModel: viewModel)
-                .frame(minHeight: 150)
+                .frame(minHeight: 150, idealHeight: 180, maxHeight: 230)
             
             // Bottom: Master Timeline
             MasterTimelineView(viewModel: viewModel)
-                .frame(minHeight: 200)
+                .frame(minHeight: 170)
+        }
+        .overlay(alignment: .topTrailing) {
+            if hasActiveClip {
+                Button {
+                    viewModel.clipEditorSplitModeEnabled.toggle()
+                } label: {
+                    Label("Cut", systemImage: "scissors")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            viewModel.clipEditorSplitModeEnabled
+                            ? Theme.accentPink.opacity(0.95)
+                            : Theme.panelBackground.opacity(0.92)
+                        )
+                        .foregroundColor(viewModel.clipEditorSplitModeEnabled ? .white : Theme.textMain)
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 10)
+                .padding(.trailing, 14)
+            }
         }
     }
 }
@@ -122,6 +149,7 @@ struct ActiveClipEditorView: View {
     var viewModel: EditorViewModel
     @State private var scrubValue: Double = 0
     @State private var isScrubbing: Bool = false
+    @State private var splitCursorArmed: Bool = false
     
     private var hasActiveClip: Bool {
         viewModel.isolatedClip != nil || viewModel.selectedClipId != nil
@@ -139,37 +167,75 @@ struct ActiveClipEditorView: View {
                     .foregroundColor(Theme.accentGreen)
                     .padding(4)
                     .background(Theme.panelBackground.opacity(0.8))
+                
                 Spacer()
             }
             
             ZStack {
                 Theme.panelBackground.opacity(0.5)
                 
-                if let isolatedClip = viewModel.isolatedClip {
-                    // Fake waveform and trim handles that can be dragged down
-                    HStack(spacing: 0) {
-                        Rectangle().fill(Color.gray).frame(width: 10)
-                        
-                        ZStack {
-                            Rectangle().fill(Theme.accentPink.opacity(0.3))
-                            WaveformView()
-                        }
-                        
-                        Rectangle().fill(Color.gray).frame(width: 10)
-                    }
-                    .padding()
-                    .overlay(
-                        VStack(spacing: 2) {
-                            Text(isolatedClip.mediaItem.name)
-                            if let lutName = viewModel.lutName(for: isolatedClip.appliedLUTID) {
-                                Text("LUT: \(lutName)")
+                if viewModel.isolatedClip != nil {
+                    VStack(alignment: .leading, spacing: 8) {
+                        GeometryReader { geo in
+                            let segments = viewModel.clipEditorSegments
+                            let totalDuration = max(viewModel.clipEditorTotalDurationSeconds(), 0.01)
+                            let horizontalPadding: CGFloat = 6
+                            let availableWidth = max(geo.size.width - (horizontalPadding * 2.0), 1)
+                            let secondsPerPoint = totalDuration / max(Double(availableWidth), 1.0)
+                            
+                            ZStack(alignment: .leading) {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(Theme.backgroundDark.opacity(0.5))
+
+                                ForEach(segments) { segment in
+                                    let segmentDuration = max(viewModel.clipEditorSegmentDurationSeconds(segment), 0.01)
+                                    let segmentStart = max(segment.startTime.seconds, 0.0)
+                                    let naturalWidth = CGFloat(segmentDuration / totalDuration) * availableWidth
+                                    let width = max(naturalWidth, 2)
+                                    let left = horizontalPadding + (CGFloat(segmentStart / totalDuration) * availableWidth)
+
+                                    ClipEditorSegmentView(
+                                        segment: segment,
+                                        width: width,
+                                        canDrag: true,
+                                        trimmingEnabled: !viewModel.clipEditorSplitModeEnabled,
+                                        onLeadingTrim: { id, translationX, anchorStart, anchorDuration in
+                                            viewModel.trimEditorSegmentLeading(
+                                                id: id,
+                                                anchorStartSeconds: anchorStart,
+                                                anchorDurationSeconds: anchorDuration,
+                                                translationSeconds: Double(translationX) * secondsPerPoint
+                                            )
+                                        },
+                                        onTrailingTrim: { id, translationX, anchorStart, anchorDuration in
+                                            viewModel.trimEditorSegmentTrailing(
+                                                id: id,
+                                                anchorStartSeconds: anchorStart,
+                                                anchorDurationSeconds: anchorDuration,
+                                                translationSeconds: Double(translationX) * secondsPerPoint
+                                            )
+                                        }
+                                    )
+                                    .offset(x: left, y: 9)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                            .simultaneousGesture(
+                                SpatialTapGesture()
+                                    .onEnded { value in
+                                        guard viewModel.clipEditorSplitModeEnabled else { return }
+                                        let localX = min(max(value.location.x - horizontalPadding, 0), availableWidth)
+                                        let splitAt = (Double(localX) / max(Double(availableWidth), 1.0)) * totalDuration
+                                        _ = viewModel.splitEditorSegment(atTimelineSeconds: splitAt)
+                                    }
+                            )
+                            .onHover { inside in
+                                updateSplitCursor(inside: inside)
                             }
                         }
-                        .font(.caption)
-                        .foregroundColor(.white)
-                    )
-                    .contentShape(Rectangle()) // ensure the whole area is draggable
-                    .draggable(isolatedClip.id.uuidString)
+                        .frame(height: 90)
+                    }
+                    .padding(10)
                 } else if let _ = viewModel.selectedClipId {
                     // Support legacy selected clip logic, though isolatedItem is preferred now
                     HStack(spacing: 0) {
@@ -253,6 +319,186 @@ struct ActiveClipEditorView: View {
                 scrubValue = newValue
             }
         }
+        .onChange(of: viewModel.clipEditorSplitModeEnabled) { _, enabled in
+            if !enabled {
+                releaseSplitCursorIfNeeded()
+            }
+        }
+        .onDisappear {
+            releaseSplitCursorIfNeeded()
+        }
+    }
+    
+    private func formatTime(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "00:00" }
+        let total = Int(seconds.rounded(.down))
+        let mins = total / 60
+        let secs = total % 60
+        return String(format: "%02d:%02d", mins, secs)
+    }
+    
+    private func updateSplitCursor(inside: Bool) {
+        if viewModel.clipEditorSplitModeEnabled && inside {
+            guard !splitCursorArmed else { return }
+            Self.scissorsCursor.push()
+            splitCursorArmed = true
+        } else {
+            releaseSplitCursorIfNeeded()
+        }
+    }
+    
+    private func releaseSplitCursorIfNeeded() {
+        guard splitCursorArmed else { return }
+        NSCursor.pop()
+        splitCursorArmed = false
+    }
+    
+    private static var scissorsCursor: NSCursor = {
+        let size = NSSize(width: 24, height: 24)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.clear.setFill()
+        NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+        if let symbol = NSImage(systemSymbolName: "scissors", accessibilityDescription: nil)?
+            .withSymbolConfiguration(symbolConfig) {
+            symbol.draw(in: NSRect(x: 5, y: 5, width: 14, height: 14))
+        }
+        image.unlockFocus()
+        return NSCursor(image: image, hotSpot: NSPoint(x: 4, y: 20))
+    }()
+}
+
+struct ClipEditorSegmentView: View {
+    var segment: TimelineClip
+    var width: CGFloat
+    var canDrag: Bool
+    var trimmingEnabled: Bool
+    var onLeadingTrim: (_ id: UUID, _ translationX: CGFloat, _ anchorStart: Double, _ anchorDuration: Double) -> Void
+    var onTrailingTrim: (_ id: UUID, _ translationX: CGFloat, _ anchorStart: Double, _ anchorDuration: Double) -> Void
+    
+    @State private var leadingAnchor: (start: Double, duration: Double)?
+    @State private var trailingAnchor: (start: Double, duration: Double)?
+    @State private var hoverArmed = false
+    
+    @ViewBuilder
+    var body: some View {
+        if canDrag {
+            segmentContent
+                .draggable(segment.id.uuidString)
+        } else {
+            segmentContent
+        }
+    }
+    
+    private var segmentContent: some View {
+        ZStack(alignment: .leading) {
+            segmentBody
+            
+            HStack(spacing: 0) {
+                trimHandle(isLeading: true)
+                Spacer(minLength: 0)
+                trimHandle(isLeading: false)
+            }
+            
+        }
+        .frame(width: width, height: 72)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Theme.backgroundDark.opacity(0.75), lineWidth: 1)
+        )
+    }
+    
+    private var segmentBody: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Theme.accentPink.opacity(0.32))
+            
+            WaveformView()
+                .padding(.horizontal, 11)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+            
+            Text(durationLabel)
+                .font(.caption2.monospacedDigit().weight(.semibold))
+                .foregroundColor(.white.opacity(0.95))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(Color.black.opacity(0.35))
+                .clipShape(Capsule())
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        }
+    }
+    
+    private var durationSeconds: Double {
+        max(0.10, segment.duration.seconds.isFinite ? segment.duration.seconds : 0.10)
+    }
+    
+    private var startSeconds: Double {
+        max(0.0, segment.startTime.seconds.isFinite ? segment.startTime.seconds : 0.0)
+    }
+    
+    private var durationLabel: String {
+        formatTime(durationSeconds)
+    }
+    
+    private func trimHandle(isLeading: Bool) -> some View {
+        let accent = isLeading ? Theme.accentGreen : Theme.accentPink
+        
+        return ZStack {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(accent.opacity(trimmingEnabled ? 0.88 : 0.35))
+            Image(systemName: isLeading ? "arrow.left.to.line.compact" : "arrow.right.to.line.compact")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.white)
+        }
+        .frame(width: 18)
+        .contentShape(Rectangle())
+        .opacity(trimmingEnabled ? 1.0 : 0.45)
+        .onHover { inside in
+            if inside && trimmingEnabled {
+                if !hoverArmed {
+                    NSCursor.resizeLeftRight.push()
+                    hoverArmed = true
+                }
+            } else if hoverArmed {
+                NSCursor.pop()
+                hoverArmed = false
+            }
+        }
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    guard trimmingEnabled else { return }
+                    
+                    if isLeading {
+                        if leadingAnchor == nil {
+                            leadingAnchor = (start: startSeconds, duration: durationSeconds)
+                        }
+                        if let anchor = leadingAnchor {
+                            onLeadingTrim(segment.id, value.translation.width, anchor.start, anchor.duration)
+                        }
+                    } else {
+                        if trailingAnchor == nil {
+                            trailingAnchor = (start: startSeconds, duration: durationSeconds)
+                        }
+                        if let anchor = trailingAnchor {
+                            onTrailingTrim(segment.id, value.translation.width, anchor.start, anchor.duration)
+                        }
+                    }
+                }
+                .onEnded { _ in
+                    leadingAnchor = nil
+                    trailingAnchor = nil
+                }
+        )
+        .onDisappear {
+            if hoverArmed {
+                NSCursor.pop()
+                hoverArmed = false
+            }
+        }
+        .help(isLeading ? "Trim from clip start" : "Trim from clip end")
     }
     
     private func formatTime(_ seconds: Double) -> String {
@@ -265,13 +511,56 @@ struct ActiveClipEditorView: View {
 }
 
 struct WaveformView: View {
+    private static let barHeights: [CGFloat] = [
+        10, 16, 24, 20, 14, 26, 30, 22, 18, 28,
+        12, 20, 26, 16, 14, 24, 30, 18, 12, 22,
+        28, 16, 10, 18, 24, 30, 20, 14, 26, 18,
+        12, 20, 28, 16, 14, 24, 30, 22, 18, 12
+    ]
+    
     var body: some View {
         HStack(spacing: 2) {
-            ForEach(0..<40) { _ in
+            ForEach(Array(Self.barHeights.enumerated()), id: \.offset) { _, height in
                 RoundedRectangle(cornerRadius: 1)
                     .fill(Theme.accentGreen.opacity(0.6))
-                    .frame(width: 3, height: CGFloat.random(in: 10...40))
+                    .frame(width: 3, height: height)
             }
+        }
+    }
+}
+
+struct ScrubbableWaveformView: View {
+    @Bindable var engine: VideoPlaybackEngine
+    @Binding var isScrubbing: Bool
+    @Binding var scrubValue: Double
+    var effectiveDuration: Double
+    
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Rectangle().fill(Theme.accentPink.opacity(0.3))
+                WaveformView()
+                
+                // Playhead indicator
+                Rectangle()
+                    .fill(Color.white)
+                    .frame(width: 2)
+                    .offset(x: max(0, min((isScrubbing ? scrubValue : engine.currentTime) / effectiveDuration, 1)) * geo.size.width)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        isScrubbing = true
+                        let percent = max(0, min(value.location.x / geo.size.width, 1))
+                        let newTime = percent * effectiveDuration
+                        scrubValue = newTime
+                        engine.seek(to: newTime, shouldPause: true)
+                    }
+                    .onEnded { _ in
+                        isScrubbing = false
+                    }
+            )
         }
     }
 }
@@ -366,9 +655,9 @@ struct MasterTimelineView: View {
                             viewModel.selectClip(id: id)
                         }, dropStringAction: { idString, trackId, _ in
                             if let uuid = UUID(uuidString: idString) {
-                                if let isolated = viewModel.isolatedClip, isolated.id == uuid {
-                                    if track.isAudioOnly && isolated.mediaItem.type == .video { return }
-                                    viewModel.addExistingClip(clip: isolated, toTrack: trackId)
+                                if let draggedClip = viewModel.draggableClip(for: uuid) {
+                                    if track.isAudioOnly && draggedClip.mediaItem.type == .video { return }
+                                    viewModel.addExistingClip(clip: draggedClip, toTrack: trackId)
                                 } else if let item = viewModel.mediaLibrary.first(where: { $0.id == uuid }) {
                                     if track.isAudioOnly && item.type == .video { return }
                                     Task {
@@ -391,9 +680,9 @@ struct MasterTimelineView: View {
                             selectionAction: nil,
                             dropStringAction: { idString, trackId, _ in
                             if let uuid = UUID(uuidString: idString) {
-                                if let isolated = viewModel.isolatedClip, isolated.id == uuid {
-                                    if track.isAudioOnly && isolated.mediaItem.type == .video { return }
-                                    viewModel.addExistingClip(clip: isolated, toTrack: trackId)
+                                if let draggedClip = viewModel.draggableClip(for: uuid) {
+                                    if track.isAudioOnly && draggedClip.mediaItem.type == .video { return }
+                                    viewModel.addExistingClip(clip: draggedClip, toTrack: trackId)
                                 } else if let item = viewModel.mediaLibrary.first(where: { $0.id == uuid }) {
                                     if track.isAudioOnly && item.type == .video { return }
                                     Task {

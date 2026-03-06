@@ -37,13 +37,43 @@ nonisolated struct HSLControl: Equatable {
 nonisolated struct ColorWheelControl: Equatable {
     var hue: Double = 0.0 // 0 to 2pi (radians)
     var intensity: Double = 0.0 // 0 to 1
+    var luma: Double = 0.0 // -1 to 1
+}
+
+nonisolated enum ColorSpaceProfile: String, CaseIterable, Equatable {
+    case rec709 = "Rec.709"
+    case displayP3 = "Display P3"
+    case bt2020 = "BT.2020"
+}
+
+nonisolated enum WorkingColorSpaceProfile: String, CaseIterable, Equatable {
+    case linearSRGB = "Linear sRGB"
+    case acescg = "ACEScg"
+}
+
+nonisolated struct ToneCurvePoints: Equatable {
+    var p0: Double = 0.0
+    var p1: Double = 0.25
+    var p2: Double = 0.5
+    var p3: Double = 0.75
+    var p4: Double = 1.0
+
+    var values: [Double] {
+        [p0, p1, p2, p3, p4]
+    }
 }
 
 nonisolated struct ColorAdjustments: Equatable {
+    // Color pipeline
+    var inputColorSpace: ColorSpaceProfile = .rec709
+    var workingColorSpace: WorkingColorSpaceProfile = .linearSRGB
+    var outputColorSpace: ColorSpaceProfile = .rec709
+
     var exposure: Double = 0
     var contrast: Double = 1.0
     var highlights: Double = 0
     var shadows: Double = 0
+    var filmicHighlightRolloff: Double = 0.0
     
     var clarity: Double = 0
     var sharpness: Double = 0
@@ -70,11 +100,28 @@ nonisolated struct ColorAdjustments: Equatable {
     var highlightTint = ColorWheelControl()
     var shadowRange: Double = 0.45
     var highlightRange: Double = 0.90
+
+    // Professional LGGO controls
+    var lift: Double = 0.0
+    var gamma: Double = 1.0
+    var gain: Double = 1.0
+    var offset: Double = 0.0
+    var liftWheel = ColorWheelControl()
+    var gammaWheel = ColorWheelControl()
+    var gainWheel = ColorWheelControl()
+    var offsetWheel = ColorWheelControl()
+
+    // Tone curves
+    var lumaCurveEnabled: Bool = true
+    var lumaCurve = ToneCurvePoints()
+    var rgbCurvesEnabled: Bool = false
+    var redCurve = ToneCurvePoints()
+    var greenCurve = ToneCurvePoints()
+    var blueCurve = ToneCurvePoints()
     
     // Effects
     var vignette: Double = 0
     var softBlur: Double = 0
-    var grain: Double = 0
 }
 
 nonisolated struct Transforms: Equatable {

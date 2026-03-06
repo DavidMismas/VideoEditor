@@ -97,6 +97,8 @@ class VideoPlaybackEngine {
             let filteredImage = CoreImageProcessor.shared.applyAdjustments(
                 processingSnapshot.adjustments,
                 lutURL: processingSnapshot.lutURL,
+                timeSeconds: params.compositionTime.isNumeric ? params.compositionTime.seconds : nil,
+                renderQuality: .preview,
                 to: params.sourceImage
             )
             return AVCIImageFilteringResult(resultImage: filteredImage)
