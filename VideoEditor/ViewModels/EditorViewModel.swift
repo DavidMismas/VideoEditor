@@ -4,6 +4,11 @@ import CoreMedia
 import AVFoundation
 import Observation
 
+enum TimelinePreviewMode {
+    case clip
+    case movie
+}
+
 @Observable
 class EditorViewModel {
     // Project Settings
@@ -23,6 +28,8 @@ class EditorViewModel {
     // Selection state
     var selectedClipId: UUID?
     var selectedMediaLibraryItemId: UUID?
+    var selectedTimelineClipID: UUID?
+    var previewMode: TimelinePreviewMode = .clip
     
     // Middle clip-editor segments (trim/split source for drag into bottom timeline)
     var clipEditorSegments: [TimelineClip] = []
@@ -45,6 +52,11 @@ class EditorViewModel {
                 }
                 return
             }
+
+            previewMode = .clip
+            selectedTimelineClipID = nil
+            moviePreviewLoadTask?.cancel()
+            moviePreviewLoadTask = nil
             
             // Only reload media when the isolated clip itself changes.
             // Slider-driven adjustment changes mutate the same clip instance and should not reset playback.
@@ -136,6 +148,7 @@ class EditorViewModel {
     private let fallbackClipDurationSeconds: Double = 5.0
     private let minimumEditorSegmentDurationSeconds: Double = 0.10
     private let clipEditorInteractionDebugLogging = true
+    @ObservationIgnored private var moviePreviewLoadTask: Task<Void, Never>?
     
     // MARK: - Intents
     
@@ -193,11 +206,13 @@ class EditorViewModel {
         // Search in video tracks
         if let idx = videoTracks.firstIndex(where: { $0.id == trackId }) {
             videoTracks[idx].clips.append(duplicatedClip)
+            refreshMovieTimelinePreviewIfNeeded()
             return
         }
         // Search in audio tracks
         if let idx = audioTracks.firstIndex(where: { $0.id == trackId }) {
             audioTracks[idx].clips.append(duplicatedClip)
+            refreshMovieTimelinePreviewIfNeeded()
             return
         }
     }
@@ -217,11 +232,13 @@ class EditorViewModel {
         // Search in video tracks
         if let idx = videoTracks.firstIndex(where: { $0.id == trackId }) {
             videoTracks[idx].clips.append(newClip)
+            refreshMovieTimelinePreviewIfNeeded()
             return
         }
         // Search in audio tracks
         if let idx = audioTracks.firstIndex(where: { $0.id == trackId }) {
             audioTracks[idx].clips.append(newClip)
+            refreshMovieTimelinePreviewIfNeeded()
             return
         }
     }
@@ -236,6 +253,8 @@ class EditorViewModel {
     }
     
     func selectClip(id: UUID?) {
+        previewMode = .clip
+        selectedTimelineClipID = nil
         selectedClipId = id
         guard let id = id, let clip = findClip(id: id), let url = clip.mediaItem.url else {
             if id == nil {
@@ -250,7 +269,16 @@ class EditorViewModel {
         engine.currentLUTURL = lutURL(for: clip.appliedLUTID)
     }
 
+    var isMovieTimelinePreviewActive: Bool {
+        previewMode == .movie
+    }
+
+    var hasMovieTimelineContent: Bool {
+        videoTracks.contains(where: { !$0.clips.isEmpty })
+    }
+
     var activePreviewClip: TimelineClip? {
+        guard !isMovieTimelinePreviewActive else { return nil }
         if let isolatedClip {
             return isolatedClip
         }
@@ -283,6 +311,7 @@ class EditorViewModel {
 
     func toggleCanvasOrientation() {
         config.canvasOrientation = config.canvasOrientation == .portrait ? .landscape : .portrait
+        refreshMovieTimelinePreviewIfNeeded()
     }
 
     func updateTransforms(for id: UUID?, _ newTransforms: Transforms) {
@@ -291,6 +320,7 @@ class EditorViewModel {
         for trackIndex in videoTracks.indices {
             if let clipIndex = videoTracks[trackIndex].clips.firstIndex(where: { $0.id == id }) {
                 videoTracks[trackIndex].clips[clipIndex].transforms = newTransforms
+                refreshMovieTimelinePreviewIfNeeded()
                 break
             }
         }
@@ -325,6 +355,7 @@ class EditorViewModel {
         for (trackIndex, track) in videoTracks.enumerated() {
             if let clipIndex = track.clips.firstIndex(where: { $0.id == id }) {
                 videoTracks[trackIndex].clips[clipIndex].adjustments = newAdjustments
+                refreshMovieTimelinePreviewIfNeeded()
                 return
             }
         }
@@ -338,6 +369,128 @@ class EditorViewModel {
             }
         }
         return nil
+    }
+
+    func activateMovieTimelinePreview(selecting clipID: UUID? = nil) {
+        previewMode = .movie
+        selectedTimelineClipID = clipID
+        selectedClipId = nil
+        refreshMovieTimelinePreview()
+    }
+
+    func deactivateMovieTimelinePreview() {
+        previewMode = .clip
+        selectedTimelineClipID = nil
+        moviePreviewLoadTask?.cancel()
+        moviePreviewLoadTask = nil
+    }
+
+    func timelineClipVolume(for clipID: UUID) -> Double {
+        if let clip = findTimelineClip(id: clipID) {
+            return Double(clip.volume)
+        }
+        return 1.0
+    }
+
+    func timelineClipIsMuted(for clipID: UUID) -> Bool {
+        findTimelineClip(id: clipID)?.isMuted ?? false
+    }
+
+    func timelineClipName(for clipID: UUID) -> String {
+        findTimelineClip(id: clipID)?.mediaItem.name ?? "Clip"
+    }
+
+    func setTimelineClipVolume(_ value: Double, for clipID: UUID) {
+        let clamped = Float(min(max(value, 0), 1))
+
+        for trackIndex in videoTracks.indices {
+            if let clipIndex = videoTracks[trackIndex].clips.firstIndex(where: { $0.id == clipID }) {
+                videoTracks[trackIndex].clips[clipIndex].volume = clamped
+                videoTracks[trackIndex].clips[clipIndex].isMuted = clamped <= 0.001
+                refreshMovieTimelinePreviewIfNeeded()
+                return
+            }
+        }
+
+        for trackIndex in audioTracks.indices {
+            if let clipIndex = audioTracks[trackIndex].clips.firstIndex(where: { $0.id == clipID }) {
+                audioTracks[trackIndex].clips[clipIndex].volume = clamped
+                audioTracks[trackIndex].clips[clipIndex].isMuted = clamped <= 0.001
+                refreshMovieTimelinePreviewIfNeeded()
+                return
+            }
+        }
+    }
+
+    func toggleTimelineClipMute(_ clipID: UUID) {
+        for trackIndex in videoTracks.indices {
+            if let clipIndex = videoTracks[trackIndex].clips.firstIndex(where: { $0.id == clipID }) {
+                videoTracks[trackIndex].clips[clipIndex].isMuted.toggle()
+                refreshMovieTimelinePreviewIfNeeded()
+                return
+            }
+        }
+
+        for trackIndex in audioTracks.indices {
+            if let clipIndex = audioTracks[trackIndex].clips.firstIndex(where: { $0.id == clipID }) {
+                audioTracks[trackIndex].clips[clipIndex].isMuted.toggle()
+                refreshMovieTimelinePreviewIfNeeded()
+                return
+            }
+        }
+    }
+
+    private func findTimelineClip(id: UUID) -> TimelineClip? {
+        for track in videoTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                return clip
+            }
+        }
+        for track in audioTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                return clip
+            }
+        }
+        return nil
+    }
+
+    private func refreshMovieTimelinePreviewIfNeeded() {
+        guard isMovieTimelinePreviewActive else { return }
+        refreshMovieTimelinePreview()
+    }
+
+    private func refreshMovieTimelinePreview() {
+        moviePreviewLoadTask?.cancel()
+
+        guard hasMovieTimelineContent else {
+            engine.pause()
+            engine.player.replaceCurrentItem(with: nil)
+            engine.currentTime = 0
+            engine.duration = 0
+            return
+        }
+
+        let videoTracksSnapshot = videoTracks
+        let audioTracksSnapshot = audioTracks
+        let configSnapshot = config
+        let lutSnapshot = importedLUTs
+
+        moviePreviewLoadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let preview = try await TimelineExporter.shared.makePreviewItem(
+                    videoTracks: videoTracksSnapshot,
+                    audioTracks: audioTracksSnapshot,
+                    config: configSnapshot,
+                    lutLibrary: lutSnapshot
+                )
+                guard !Task.isCancelled, self.isMovieTimelinePreviewActive else { return }
+                self.engine.loadPreviewItem(preview.item, duration: preview.totalDuration.seconds)
+            } catch {
+                guard !Task.isCancelled else { return }
+                print("Failed to build movie preview: \(error)")
+            }
+        }
     }
     
     @discardableResult
@@ -360,6 +513,7 @@ class EditorViewModel {
                     }
                     engine.currentLUTURL = lut.url
                 }
+                refreshMovieTimelinePreviewIfNeeded()
                 return true
             }
         }
@@ -370,6 +524,7 @@ class EditorViewModel {
                 clipEditorSegments[index].appliedLUTID = lutID
             }
             engine.currentLUTURL = lut.url
+            refreshMovieTimelinePreviewIfNeeded()
             return true
         }
         

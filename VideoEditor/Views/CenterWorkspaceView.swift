@@ -41,11 +41,18 @@ struct LivePreviewView: View {
     private var hasActivePreviewClip: Bool {
         viewModel.activePreviewClip != nil
     }
+
+    private var hasPreviewContent: Bool {
+        if viewModel.isMovieTimelinePreviewActive {
+            return viewModel.hasMovieTimelineContent
+        }
+        return hasActivePreviewClip
+    }
     
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Live Preview")
+                Text(viewModel.isMovieTimelinePreviewActive ? "Movie Preview" : "Live Preview")
                     .foregroundColor(Theme.textSecondary)
                 Spacer()
 
@@ -68,7 +75,7 @@ struct LivePreviewView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.horizontal, 4)
-                .disabled(!hasActivePreviewClip)
+                .disabled(!hasActivePreviewClip || viewModel.isMovieTimelinePreviewActive)
 
                 if cropModeEnabled {
                     Button("Cancel", action: cancelCropEditing)
@@ -92,7 +99,7 @@ struct LivePreviewView: View {
             ZStack {
                 Color.black
                 
-                if hasActivePreviewClip {
+                if hasPreviewContent {
                     GeometryReader { geo in
                         let canvasSize = fittedCanvasSize(in: geo.size, aspectRatio: viewModel.canvasAspectRatio)
                         let sourceAspectRatio = viewModel.previewSourceAspectRatio
@@ -126,7 +133,7 @@ struct LivePreviewView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                     }
                 } else {
-                    Text("Select a clip or play the timeline to display preview")
+                    Text("Select a clip or activate the movie timeline to display preview")
                         .foregroundColor(Color(white: 0.3))
                 }
             }
@@ -148,6 +155,12 @@ struct LivePreviewView: View {
                 pendingCropRect = fitted
             } else {
                 viewModel.setActivePreviewCropRect(fitted)
+            }
+        }
+        .onChange(of: viewModel.previewMode) { _, newValue in
+            if newValue == .movie {
+                cropModeEnabled = false
+                pendingCropRect = nil
             }
         }
     }
@@ -1138,13 +1151,27 @@ struct MasterTimelineView: View {
         let rowSpacing = CGFloat(max(viewModel.videoTracks.count + viewModel.audioTracks.count - 1, 0)) * 4
         return 24 + 4 + videoHeight + audioHeight + rowSpacing
     }
+
+    private var selectedTimelineClipID: UUID? {
+        viewModel.selectedTimelineClipID
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Text("Movie Timeline")
                     .font(.caption)
-                    .foregroundColor(Theme.textMain)
+                    .foregroundColor(viewModel.isMovieTimelinePreviewActive ? Theme.accentPink : Theme.textMain)
+
+                if viewModel.isMovieTimelinePreviewActive {
+                    Text("Preview Active")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Theme.accentPink.opacity(0.9))
+                        .clipShape(Capsule())
+                }
                 
                 Spacer()
                 
@@ -1175,6 +1202,40 @@ struct MasterTimelineView: View {
             }
             .padding(6)
             .background(Theme.panelBackground.opacity(0.8))
+
+            if let selectedTimelineClipID {
+                HStack(spacing: 10) {
+                    Text(viewModel.timelineClipName(for: selectedTimelineClipID))
+                        .font(.caption)
+                        .foregroundColor(Theme.textMain)
+                        .lineLimit(1)
+
+                    Button {
+                        viewModel.toggleTimelineClipMute(selectedTimelineClipID)
+                    } label: {
+                        Image(systemName: viewModel.timelineClipIsMuted(for: selectedTimelineClipID) ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                            .foregroundColor(viewModel.timelineClipIsMuted(for: selectedTimelineClipID) ? Theme.accentPink : Theme.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.timelineClipVolume(for: selectedTimelineClipID) },
+                            set: { viewModel.setTimelineClipVolume($0, for: selectedTimelineClipID) }
+                        ),
+                        in: 0...1
+                    )
+                    .tint(Theme.accentGreen)
+
+                    Text("\(Int((viewModel.timelineClipVolume(for: selectedTimelineClipID) * 100).rounded()))%")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(Theme.textSecondary)
+                        .frame(width: 42, alignment: .trailing)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Theme.backgroundDark.opacity(0.45))
+            }
             
             ScrollView(.horizontal) {
                 ZStack(alignment: .topLeading) {
@@ -1186,7 +1247,9 @@ struct MasterTimelineView: View {
                             laneHeaderWidth: laneHeaderWidth,
                             playheadSeconds: playheadSeconds
                         ) { seconds in
+                            viewModel.activateMovieTimelinePreview()
                             playheadSeconds = seconds
+                            viewModel.engine.seek(to: seconds, shouldPause: true)
                         }
                         
                         // Video Tracks
@@ -1196,11 +1259,11 @@ struct MasterTimelineView: View {
                                 timelineWidth: timelineWidth,
                                 pixelsPerSecond: pixelsPerSecond,
                                 laneHeaderWidth: laneHeaderWidth,
-                                isSelected: .constant(false),
+                                selectedClipID: selectedTimelineClipID,
                                 lutNameProvider: { viewModel.lutName(for: $0) },
                                 selectionAction: { id in
-                                viewModel.selectClip(id: id)
-                            }, dropStringAction: { idString, trackId, _ in
+                                    viewModel.activateMovieTimelinePreview(selecting: id)
+                                }, dropStringAction: { idString, trackId, _ in
                                 if let uuid = UUID(uuidString: idString) {
                                     if let draggedClip = viewModel.draggableClip(for: uuid) {
                                         if track.isAudioOnly && draggedClip.mediaItem.type == .video { return }
@@ -1222,9 +1285,11 @@ struct MasterTimelineView: View {
                                 timelineWidth: timelineWidth,
                                 pixelsPerSecond: pixelsPerSecond,
                                 laneHeaderWidth: laneHeaderWidth,
-                                isSelected: .constant(false),
+                                selectedClipID: selectedTimelineClipID,
                                 lutNameProvider: nil,
-                                selectionAction: nil,
+                                selectionAction: { id in
+                                    viewModel.activateMovieTimelinePreview(selecting: id)
+                                },
                                 dropStringAction: { idString, trackId, _ in
                                 if let uuid = UUID(uuidString: idString) {
                                     if let draggedClip = viewModel.draggableClip(for: uuid) {
@@ -1256,8 +1321,16 @@ struct MasterTimelineView: View {
                         .allowsHitTesting(false)
                 }
                 .padding()
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    viewModel.activateMovieTimelinePreview()
+                }
             }
             .background(Color(white: 0.12))
+        }
+        .onChange(of: viewModel.engine.currentTime) { _, newValue in
+            guard viewModel.isMovieTimelinePreviewActive else { return }
+            playheadSeconds = newValue
         }
     }
     
@@ -1287,7 +1360,7 @@ struct TimelineTrackRow: View {
     var timelineWidth: CGFloat
     var pixelsPerSecond: CGFloat
     var laneHeaderWidth: CGFloat
-    @Binding var isSelected: Bool
+    var selectedClipID: UUID?
     var lutNameProvider: ((UUID) -> String?)?
     var selectionAction: ((UUID) -> Void)?
     var dropStringAction: ((String, UUID, UUID?) -> Void)?
@@ -1316,9 +1389,10 @@ struct TimelineTrackRow: View {
                 } else {
                     HStack(spacing: 0) {
                         ForEach(track.clips) { clip in
+                            let isSelected = selectedClipID == clip.id
                             ZStack(alignment: .bottomLeading) {
                                 Rectangle()
-                                .fill(track.isAudioOnly ? Theme.accentGreen : Theme.accentPink)
+                                    .fill(track.isAudioOnly ? Theme.accentGreen : Theme.accentPink)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(clip.mediaItem.name)
                                         .font(.caption2.weight(.semibold))
@@ -1339,7 +1413,10 @@ struct TimelineTrackRow: View {
                                 .padding(.vertical, 4)
                             }
                                 .frame(width: clipWidth(clip))
-                                .border(Theme.backgroundDark, width: 1)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 0)
+                                        .stroke(isSelected ? Theme.accentGreen : Theme.backgroundDark, lineWidth: isSelected ? 2 : 1)
+                                )
                                 .onTapGesture {
                                     selectionAction?(clip.id)
                                 }

@@ -17,6 +17,10 @@ struct InspectorView: View {
     private var hasActiveClipSelection: Bool {
         viewModel.selectedClipId != nil || viewModel.isolatedClip != nil
     }
+
+    private var isMovieTimelineLocked: Bool {
+        viewModel.isMovieTimelinePreviewActive
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -30,6 +34,13 @@ struct InspectorView: View {
             
             ScrollView {
                 VStack(spacing: 16) {
+                    if isMovieTimelineLocked {
+                        Text("Movie preview is active. Clip editing controls are locked to avoid accidental changes.")
+                            .font(.caption)
+                            .foregroundColor(Theme.textSecondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
                     LUTLibrarySection(viewModel: viewModel)
                     
                     if !hasActiveClipSelection {
@@ -49,6 +60,8 @@ struct InspectorView: View {
                     EffectsSection(adjustments: baseAdjustments)
                 }
                 .padding()
+                .disabled(isMovieTimelineLocked)
+                .opacity(isMovieTimelineLocked ? 0.42 : 1)
             }
 
             Divider()

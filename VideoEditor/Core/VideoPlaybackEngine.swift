@@ -90,6 +90,18 @@ class VideoPlaybackEngine {
             }
         }
     }
+
+    func loadPreviewItem(_ item: AVPlayerItem, duration: Double? = nil) {
+        videoComposition = item.videoComposition
+        player.replaceCurrentItem(with: item)
+        self.duration = max(duration ?? item.asset.duration.seconds, 0)
+        currentTime = 0
+        isPlaying = false
+        presentationSize = item.presentationSize
+        Task {
+            await player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+    }
     
     private func makeVideoComposition(for asset: AVAsset) async throws -> AVVideoComposition {
         let adjustmentsStore = self.adjustmentsStore

@@ -13,6 +13,7 @@ final class TimelineExporter {
         let adjustments: ColorAdjustments
         let lutURL: URL?
         let transforms: Transforms
+        let layerIndex: Int
     }
     
     private final class TranscodeContext: @unchecked Sendable {
@@ -82,6 +83,7 @@ final class TimelineExporter {
             try await transcode(
                 composition: build.composition,
                 videoComposition: build.videoComposition,
+                audioMix: build.audioMix,
                 totalDuration: build.totalDuration,
                 config: config,
                 format: format,
@@ -100,10 +102,30 @@ final class TimelineExporter {
             throw TimelineExportError.exportFailed(error.localizedDescription)
         }
     }
+
+    func makePreviewItem(
+        videoTracks: [TimelineTrack],
+        audioTracks: [TimelineTrack],
+        config: ProjectConfig,
+        lutLibrary: [LUTItem] = []
+    ) async throws -> (item: AVPlayerItem, totalDuration: CMTime) {
+        let build = try await buildComposition(
+            videoTracks: videoTracks,
+            audioTracks: audioTracks,
+            config: config,
+            lutLibrary: lutLibrary
+        )
+
+        let item = AVPlayerItem(asset: build.composition)
+        item.videoComposition = build.videoComposition
+        item.audioMix = build.audioMix
+        return (item, build.totalDuration)
+    }
     
     private func transcode(
         composition: AVMutableComposition,
         videoComposition: AVVideoComposition,
+        audioMix: AVAudioMix?,
         totalDuration: CMTime,
         config: ProjectConfig,
         format: ExportFormat,
@@ -162,6 +184,7 @@ final class TimelineExporter {
         if !compositionAudioTracks.isEmpty {
             let audioOutput = AVAssetReaderAudioMixOutput(audioTracks: compositionAudioTracks, audioSettings: nil)
             audioOutput.alwaysCopiesSampleData = false
+            audioOutput.audioMix = audioMix
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVNumberOfChannelsKey: 2,
@@ -302,78 +325,98 @@ final class TimelineExporter {
         audioTracks: [TimelineTrack],
         config: ProjectConfig,
         lutLibrary: [LUTItem]
-    ) async throws -> (composition: AVMutableComposition, videoComposition: AVVideoComposition, totalDuration: CMTime) {
-        guard let primaryVideoTrack = videoTracks.first(where: { !$0.isAudioOnly && !$0.clips.isEmpty }) else {
+    ) async throws -> (composition: AVMutableComposition, videoComposition: AVVideoComposition, audioMix: AVAudioMix?, totalDuration: CMTime) {
+        let populatedVideoTracks = videoTracks.enumerated().filter { !$0.element.isAudioOnly && !$0.element.clips.isEmpty }
+        guard !populatedVideoTracks.isEmpty else {
             throw TimelineExportError.noVideoClips
         }
         
         let composition = AVMutableComposition()
-        
-        guard let compositionVideoTrack = composition.addMutableTrack(
-            withMediaType: .video,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-        ) else {
-            throw TimelineExportError.unableToCreateCompositionTrack
-        }
-        
-        let primaryAudioTrack = composition.addMutableTrack(
-            withMediaType: .audio,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-        )
-        
+
         var clipSegments: [ClipSegment] = []
-        var timelineCursor = CMTime.zero
-        var preferredTransformSet = false
+        var totalTimelineDuration = CMTime.zero
+        var naturalSizeSet = false
         let lutMap = Dictionary(uniqueKeysWithValues: lutLibrary.map { ($0.id, $0.url) })
-        
-        for clip in primaryVideoTrack.clips {
-            guard let sourceURL = clip.mediaItem.url else {
-                throw TimelineExportError.clipMissingURL(clip.mediaItem.name)
+
+        struct AudioMixLane {
+            let track: AVMutableCompositionTrack
+            var segments: [(timeRange: CMTimeRange, volume: Float)]
+        }
+
+        var audioMixLanes: [AudioMixLane] = []
+
+        for (layerIndex, lane) in populatedVideoTracks {
+            guard let compositionVideoTrack = composition.addMutableTrack(
+                withMediaType: .video,
+                preferredTrackID: kCMPersistentTrackID_Invalid
+            ) else {
+                throw TimelineExportError.unableToCreateCompositionTrack
             }
-            
-            let asset = AVURLAsset(url: sourceURL)
-            guard let sourceVideoTrack = try await asset.loadTracks(withMediaType: .video).first else {
-                continue
-            }
-            
-            let sourceDuration = try await asset.load(.duration)
-            guard sourceDuration.isNumeric else { continue }
-            let sourceStart = clip.startTime.isNumeric ? clip.startTime : .zero
-            let availableDurationRaw = CMTimeSubtract(sourceDuration, sourceStart)
-            guard availableDurationRaw.isNumeric else { continue }
-            let availableDuration = CMTimeMaximum(.zero, availableDurationRaw)
-            guard availableDuration.isNumeric, availableDuration > .zero else { continue }
-            
-            let requestedDuration = (clip.duration.isNumeric && clip.duration > .zero) ? clip.duration : availableDuration
-            let finalDuration = CMTimeMinimum(requestedDuration, availableDuration)
-            guard finalDuration.isNumeric, finalDuration > .zero else { continue }
-            let sourceRange = CMTimeRange(start: sourceStart, duration: finalDuration)
-            
-            try compositionVideoTrack.insertTimeRange(sourceRange, of: sourceVideoTrack, at: timelineCursor)
-            
-            if !preferredTransformSet {
-                let preferredTransform = try await sourceVideoTrack.load(.preferredTransform)
-                let naturalSize = try await sourceVideoTrack.load(.naturalSize)
-                compositionVideoTrack.preferredTransform = preferredTransform
-                composition.naturalSize = Self.orientedSize(for: naturalSize, preferredTransform: preferredTransform)
-                preferredTransformSet = true
-            }
-            if !clip.isMuted,
-               let sourceAudioTrack = try await asset.loadTracks(withMediaType: .audio).first,
-               let primaryAudioTrack {
-                try primaryAudioTrack.insertTimeRange(sourceRange, of: sourceAudioTrack, at: timelineCursor)
-            }
-            
-            let segmentTimeRange = CMTimeRange(start: timelineCursor, duration: finalDuration)
-            clipSegments.append(
-                ClipSegment(
-                    timeRange: segmentTimeRange,
-                    adjustments: clip.adjustments,
-                    lutURL: clip.appliedLUTID.flatMap { lutMap[$0] },
-                    transforms: clip.transforms
-                )
+
+            let laneAudioTrack = composition.addMutableTrack(
+                withMediaType: .audio,
+                preferredTrackID: kCMPersistentTrackID_Invalid
             )
-            timelineCursor = CMTimeAdd(timelineCursor, finalDuration)
+            if let laneAudioTrack {
+                audioMixLanes.append(AudioMixLane(track: laneAudioTrack, segments: []))
+            }
+
+            var laneCursor = CMTime.zero
+            for clip in lane.clips {
+                guard let sourceURL = clip.mediaItem.url else {
+                    throw TimelineExportError.clipMissingURL(clip.mediaItem.name)
+                }
+
+                let asset = AVURLAsset(url: sourceURL)
+                guard let sourceVideoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+                    continue
+                }
+
+                let sourceDuration = try await asset.load(.duration)
+                guard sourceDuration.isNumeric else { continue }
+                let sourceStart = clip.startTime.isNumeric ? clip.startTime : .zero
+                let availableDurationRaw = CMTimeSubtract(sourceDuration, sourceStart)
+                guard availableDurationRaw.isNumeric else { continue }
+                let availableDuration = CMTimeMaximum(.zero, availableDurationRaw)
+                guard availableDuration.isNumeric, availableDuration > .zero else { continue }
+
+                let requestedDuration = (clip.duration.isNumeric && clip.duration > .zero) ? clip.duration : availableDuration
+                let finalDuration = CMTimeMinimum(requestedDuration, availableDuration)
+                guard finalDuration.isNumeric, finalDuration > .zero else { continue }
+                let sourceRange = CMTimeRange(start: sourceStart, duration: finalDuration)
+
+                try compositionVideoTrack.insertTimeRange(sourceRange, of: sourceVideoTrack, at: laneCursor)
+
+                if !naturalSizeSet {
+                    let naturalSize = try await sourceVideoTrack.load(.naturalSize)
+                    composition.naturalSize = naturalSize
+                    naturalSizeSet = true
+                }
+
+                if !clip.isMuted,
+                   let sourceAudioTrack = try await asset.loadTracks(withMediaType: .audio).first,
+                   let laneAudioTrack,
+                   let laneIndex = audioMixLanes.firstIndex(where: { $0.track.trackID == laneAudioTrack.trackID }) {
+                    try laneAudioTrack.insertTimeRange(sourceRange, of: sourceAudioTrack, at: laneCursor)
+                    let segmentTimeRange = CMTimeRange(start: laneCursor, duration: finalDuration)
+                    let clampedVolume = min(max(clip.volume, 0), 1)
+                    audioMixLanes[laneIndex].segments.append((timeRange: segmentTimeRange, volume: clampedVolume))
+                }
+
+                let segmentTimeRange = CMTimeRange(start: laneCursor, duration: finalDuration)
+                clipSegments.append(
+                    ClipSegment(
+                        timeRange: segmentTimeRange,
+                        adjustments: clip.adjustments,
+                        lutURL: clip.appliedLUTID.flatMap { lutMap[$0] },
+                        transforms: clip.transforms,
+                        layerIndex: layerIndex
+                    )
+                )
+                laneCursor = CMTimeAdd(laneCursor, finalDuration)
+            }
+
+            totalTimelineDuration = CMTimeMaximum(totalTimelineDuration, laneCursor)
         }
         
         for lane in audioTracks where !lane.clips.isEmpty {
@@ -383,6 +426,9 @@ final class TimelineExporter {
             ) else {
                 continue
             }
+
+            audioMixLanes.append(AudioMixLane(track: compositionAudioTrack, segments: []))
+            let laneMixIndex = audioMixLanes.count - 1
             
             var laneCursor = CMTime.zero
             for clip in lane.clips {
@@ -404,14 +450,38 @@ final class TimelineExporter {
                 let sourceRange = CMTimeRange(start: sourceStart, duration: finalDuration)
                 
                 try compositionAudioTrack.insertTimeRange(sourceRange, of: sourceAudioTrack, at: laneCursor)
+                let segmentTimeRange = CMTimeRange(start: laneCursor, duration: finalDuration)
+                let clampedVolume = clip.isMuted ? Float(0) : min(max(clip.volume, 0), 1)
+                audioMixLanes[laneMixIndex].segments.append((timeRange: segmentTimeRange, volume: clampedVolume))
                 laneCursor = CMTimeAdd(laneCursor, finalDuration)
             }
+
+            totalTimelineDuration = CMTimeMaximum(totalTimelineDuration, laneCursor)
         }
         
-        if !timelineCursor.isNumeric || timelineCursor <= .zero {
+        if !totalTimelineDuration.isNumeric || totalTimelineDuration <= .zero {
             throw TimelineExportError.noVideoClips
         }
         
+        let audioMix: AVAudioMix? = {
+            let inputParameters = audioMixLanes.compactMap { lane -> AVAudioMixInputParameters? in
+                guard !lane.segments.isEmpty else { return nil }
+                let parameters = AVMutableAudioMixInputParameters(track: lane.track)
+                for segment in lane.segments {
+                    parameters.setVolumeRamp(
+                        fromStartVolume: segment.volume,
+                        toEndVolume: segment.volume,
+                        timeRange: segment.timeRange
+                    )
+                }
+                return parameters
+            }
+            guard !inputParameters.isEmpty else { return nil }
+            let mix = AVMutableAudioMix()
+            mix.inputParameters = inputParameters
+            return mix
+        }()
+
         let exportProcessor = CoreImageProcessor.shared
         let clipMap = clipSegments
         let defaultAdjustments = ColorAdjustments()
@@ -423,7 +493,8 @@ final class TimelineExporter {
         
         let baseVideoComposition = try await AVVideoComposition(applyingFiltersTo: composition, applier: { params in
             let compositionTime = params.compositionTime
-            let clipSegment = clipMap.first(where: { segment in
+            let clipSegment = clipMap
+                .filter { segment in
                 guard segment.timeRange.start.isNumeric,
                       segment.timeRange.duration.isNumeric,
                       segment.timeRange.duration > .zero,
@@ -434,7 +505,8 @@ final class TimelineExporter {
                 let start = segment.timeRange.start
                 let end = CMTimeAdd(start, segment.timeRange.duration)
                 return CMTimeCompare(compositionTime, start) >= 0 && CMTimeCompare(compositionTime, end) < 0
-            })
+                }
+                .max(by: { lhs, rhs in lhs.layerIndex < rhs.layerIndex })
             let clipAdjustments = clipSegment?.adjustments ?? defaultAdjustments
             let clipLUTURL = clipSegment?.lutURL
             let clipTransforms = clipSegment?.transforms ?? Transforms()
@@ -450,7 +522,10 @@ final class TimelineExporter {
         })
         
         var videoConfiguration = try await AVVideoComposition.Configuration(for: composition)
-        videoConfiguration.instructions = baseVideoComposition.instructions
+        videoConfiguration.instructions = Self.makeIdentityTransformInstructions(
+            for: composition.tracks(withMediaType: .video),
+            duration: totalTimelineDuration
+        )
         videoConfiguration.customVideoCompositorClass = baseVideoComposition.customVideoCompositorClass
         videoConfiguration.sourceSampleDataTrackIDs = baseVideoComposition.sourceSampleDataTrackIDs
         let safeFrameRate = max(config.frameRate, 1)
@@ -460,17 +535,24 @@ final class TimelineExporter {
         
         let videoComposition = AVVideoComposition(configuration: videoConfiguration)
         
-        return (composition, videoComposition, timelineCursor)
+        return (composition, videoComposition, audioMix, totalTimelineDuration)
     }
-    
-    nonisolated private static func orientedSize(for naturalSize: CGSize, preferredTransform: CGAffineTransform) -> CGSize {
-        let transformedRect = CGRect(origin: .zero, size: naturalSize)
-            .applying(preferredTransform)
-            .standardized
-        return CGSize(
-            width: abs(transformedRect.width),
-            height: abs(transformedRect.height)
-        )
+
+    nonisolated private static func makeIdentityTransformInstructions(
+        for videoTracks: [AVAssetTrack],
+        duration: CMTime
+    ) -> [AVVideoCompositionInstructionProtocol] {
+        let layerInstructions: [AVVideoCompositionLayerInstruction] = videoTracks.reversed().map { track in
+            let instruction = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+            instruction.setTransform(.identity, at: .zero)
+            return instruction
+        }
+
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+        instruction.layerInstructions = layerInstructions
+        instruction.enablePostProcessing = true
+        return [instruction]
     }
     
     nonisolated private static func applyCanvasCrop(_ normalizedCropRect: CGRect?, to image: CIImage, renderSize: CGSize) -> CIImage {
