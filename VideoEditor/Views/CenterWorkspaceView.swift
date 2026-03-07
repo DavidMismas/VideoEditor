@@ -30,12 +30,17 @@ struct CenterWorkspaceView: View {
     }
 }
 
-import AVKit
+import AVFoundation
 
 // Top: Live Preview
 struct LivePreviewView: View {
     var viewModel: EditorViewModel
-    @State private var isPortrait = false
+    @State private var cropModeEnabled = false
+    @State private var pendingCropRect: CGRect?
+
+    private var hasActivePreviewClip: Bool {
+        viewModel.activePreviewClip != nil
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -51,30 +56,75 @@ struct LivePreviewView: View {
                 .buttonStyle(.plain)
                 .padding(.horizontal, 6)
                 
-                Button(action: { isPortrait.toggle() }) {
-                    Image(systemName: isPortrait ? "rectangle.portrait" : "rectangle")
+                Button(action: toggleCanvasOrientation) {
+                    Image(systemName: viewModel.canvasOrientation.previewSymbolName)
                         .foregroundColor(Theme.accentPink)
                 }
                 .buttonStyle(.plain)
                 
-                Button(action: {}) {
+                Button(action: toggleCropMode) {
                     Image(systemName: "crop")
-                        .foregroundColor(Theme.textMain)
+                        .foregroundColor(cropModeEnabled ? Theme.accentGreen : Theme.textMain)
                 }
                 .buttonStyle(.plain)
                 .padding(.horizontal, 4)
+                .disabled(!hasActivePreviewClip)
+
+                if cropModeEnabled {
+                    Button("Cancel", action: cancelCropEditing)
+                        .buttonStyle(.plain)
+                        .foregroundColor(Theme.textSecondary)
+                        .keyboardShortcut(.cancelAction)
+
+                    Button("Apply", action: applyCropEditing)
+                        .buttonStyle(.plain)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Theme.accentGreen.opacity(0.95))
+                        .clipShape(Capsule())
+                        .keyboardShortcut(.defaultAction)
+                }
             }
             .padding(8)
             .background(Theme.panelBackground.opacity(0.8))
             
-            // Actual Video Player
             ZStack {
                 Color.black
                 
-                if viewModel.selectedClipId != nil || viewModel.isolatedClip != nil {
-                    VideoPlayer(player: viewModel.engine.player)
-                        .aspectRatio(isPortrait ? 9/16 : 16/9, contentMode: .fit)
-                        .padding()
+                if hasActivePreviewClip {
+                    GeometryReader { geo in
+                        let canvasSize = fittedCanvasSize(in: geo.size, aspectRatio: viewModel.canvasAspectRatio)
+                        let sourceAspectRatio = viewModel.previewSourceAspectRatio
+                        let effectiveCropRect = effectiveCropRect(sourceAspectRatio: sourceAspectRatio)
+
+                        ZStack(alignment: .center) {
+                            PreviewCanvasPlayer(
+                                player: viewModel.engine.player,
+                                canvasSize: canvasSize,
+                                sourceAspectRatio: sourceAspectRatio,
+                                cropRect: effectiveCropRect
+                            )
+
+                            if cropModeEnabled {
+                                PreviewCropPanOverlay(
+                                    cropRect: Binding(
+                                        get: { effectiveCropRect },
+                                        set: { pendingCropRect = $0 }
+                                    ),
+                                    sourceAspectRatio: sourceAspectRatio,
+                                    canvasAspectRatio: viewModel.canvasAspectRatio,
+                                    canvasSize: canvasSize
+                                )
+                            }
+                        }
+                        .frame(width: canvasSize.width, height: canvasSize.height)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Theme.accentPink.opacity(0.95), lineWidth: 2)
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    }
                 } else {
                     Text("Select a clip or play the timeline to display preview")
                         .foregroundColor(Color(white: 0.3))
@@ -82,6 +132,385 @@ struct LivePreviewView: View {
             }
         }
         .background(Color(white: 0.1))
+        .onChange(of: viewModel.activePreviewClipID) { _, newValue in
+            if newValue == nil {
+                cropModeEnabled = false
+                pendingCropRect = nil
+            }
+        }
+        .onChange(of: viewModel.canvasOrientation) { _, _ in
+            guard hasActivePreviewClip else { return }
+            let fitted = fittedCropRect(
+                currentRect: cropModeEnabled ? pendingCropRect : viewModel.activePreviewTransforms.cropRect,
+                sourceAspectRatio: viewModel.previewSourceAspectRatio
+            )
+            if cropModeEnabled {
+                pendingCropRect = fitted
+            } else {
+                viewModel.setActivePreviewCropRect(fitted)
+            }
+        }
+    }
+
+    private func toggleCropMode() {
+        guard hasActivePreviewClip else { return }
+        if cropModeEnabled {
+            cancelCropEditing()
+        } else {
+            pendingCropRect = effectiveCropRect(sourceAspectRatio: viewModel.previewSourceAspectRatio)
+            cropModeEnabled = true
+        }
+    }
+
+    private func toggleCanvasOrientation() {
+        viewModel.toggleCanvasOrientation()
+    }
+
+    private func applyCropEditing() {
+        let crop = effectiveCropRect(sourceAspectRatio: viewModel.previewSourceAspectRatio)
+        viewModel.setActivePreviewCropRect(crop)
+        cropModeEnabled = false
+        pendingCropRect = nil
+    }
+
+    private func cancelCropEditing() {
+        cropModeEnabled = false
+        pendingCropRect = nil
+    }
+
+    private func fittedCanvasSize(in availableSize: CGSize, aspectRatio: CGFloat) -> CGSize {
+        guard availableSize.width > 1, availableSize.height > 1, aspectRatio > 0 else { return .zero }
+        let widthLimitedHeight = availableSize.width / aspectRatio
+        if widthLimitedHeight <= availableSize.height {
+            return CGSize(width: availableSize.width, height: widthLimitedHeight)
+        }
+        return CGSize(width: availableSize.height * aspectRatio, height: availableSize.height)
+    }
+
+    private func effectiveCropRect(sourceAspectRatio: CGFloat) -> CGRect {
+        fittedCropRect(
+            currentRect: cropModeEnabled ? pendingCropRect : viewModel.activePreviewTransforms.cropRect,
+            sourceAspectRatio: sourceAspectRatio
+        )
+    }
+
+    private func fittedCropRect(currentRect: CGRect?, sourceAspectRatio: CGFloat) -> CGRect {
+        CanvasCropMath.fittedNormalizedCropRect(
+            currentRect,
+            sourceAspect: sourceAspectRatio,
+            canvasAspect: viewModel.canvasAspectRatio
+        )
+    }
+}
+
+private struct PreviewCanvasPlayer: View {
+    let player: AVPlayer
+    let canvasSize: CGSize
+    let sourceAspectRatio: CGFloat
+    let cropRect: CGRect
+
+    var body: some View {
+        let sourceWidth = max(sourceAspectRatio, 0.001)
+        let cropWidth = max(cropRect.width * sourceWidth, 0.001)
+        let cropHeight = max(cropRect.height, 0.001)
+        let scale = min(canvasSize.width / cropWidth, canvasSize.height / cropHeight)
+        let fullWidth = sourceWidth * scale
+        let fullHeight = scale
+        let offsetX = -(cropRect.minX * sourceWidth * scale)
+        let offsetY = -(cropRect.minY * scale)
+
+        return ZStack(alignment: .topLeading) {
+            PreviewPlayerLayerView(player: player)
+                .frame(width: fullWidth, height: fullHeight)
+                .offset(x: offsetX, y: offsetY)
+        }
+        .frame(width: canvasSize.width, height: canvasSize.height)
+        .background(Color.black)
+            .clipped()
+            .contentShape(Rectangle())
+    }
+}
+
+private struct PreviewCropPanOverlay: View {
+    @Binding var cropRect: CGRect?
+    let sourceAspectRatio: CGFloat
+    let canvasAspectRatio: CGFloat
+    let canvasSize: CGSize
+
+    @State private var panSession: PreviewCropPanSession?
+    @State private var zoomSession: PreviewCropZoomSession?
+
+    private let handleSize: CGFloat = 18
+    private let handleInset: CGFloat = 16
+
+    private var effectiveCropRect: CGRect {
+        CanvasCropMath.fittedNormalizedCropRect(
+            cropRect,
+            sourceAspect: sourceAspectRatio,
+            canvasAspect: canvasAspectRatio
+        )
+    }
+
+    var body: some View {
+        ZStack {
+            panTarget
+
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Theme.accentGreen.opacity(0.95), style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.08)))
+                .allowsHitTesting(false)
+
+            cropGrid
+
+            moveBadge
+
+            ForEach(PreviewCropZoomCorner.allCases, id: \.self) { corner in
+                zoomHandle(for: corner)
+            }
+
+            cropHelpLabel
+        }
+        .frame(width: canvasSize.width, height: canvasSize.height)
+        .contentShape(Rectangle())
+    }
+
+    private var cropGrid: some View {
+        GeometryReader { geo in
+            Path { path in
+                let width = geo.size.width
+                let height = geo.size.height
+                path.move(to: CGPoint(x: width / 3, y: 0))
+                path.addLine(to: CGPoint(x: width / 3, y: height))
+                path.move(to: CGPoint(x: width * 2 / 3, y: 0))
+                path.addLine(to: CGPoint(x: width * 2 / 3, y: height))
+                path.move(to: CGPoint(x: 0, y: height / 3))
+                path.addLine(to: CGPoint(x: width, y: height / 3))
+                path.move(to: CGPoint(x: 0, y: height * 2 / 3))
+                path.addLine(to: CGPoint(x: width, y: height * 2 / 3))
+            }
+            .stroke(Color.white.opacity(0.22), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+        }
+        .allowsHitTesting(false)
+    }
+
+    private var panTarget: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        if panSession == nil {
+                            panSession = PreviewCropPanSession(initialRect: effectiveCropRect)
+                        }
+
+                        guard let panSession else { return }
+                        cropRect = updatedRect(for: panSession, translation: value.translation)
+                    }
+                    .onEnded { _ in
+                        panSession = nil
+                    }
+            )
+    }
+
+    private var moveBadge: some View {
+        VStack {
+            Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(.white)
+                .padding(10)
+                .background(Circle().fill(Color.black.opacity(0.55)))
+                .overlay(Circle().stroke(Theme.accentGreen.opacity(0.9), lineWidth: 2))
+
+            Text("Drag video")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.white.opacity(0.9))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color.black.opacity(0.45)))
+        }
+        .allowsHitTesting(false)
+    }
+
+    private var cropHelpLabel: some View {
+        VStack {
+            Spacer()
+
+            Text("Drag inside preview to position. Drag corners to zoom. Enter applies crop.")
+                .font(.caption2.weight(.medium))
+                .foregroundColor(.white.opacity(0.92))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(Color.black.opacity(0.48)))
+                .padding(.bottom, 12)
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func zoomHandle(for corner: PreviewCropZoomCorner) -> some View {
+        Circle()
+            .fill(Theme.accentGreen)
+            .frame(width: handleSize, height: handleSize)
+            .overlay(Circle().stroke(Color.white.opacity(0.92), lineWidth: 1.5))
+            .shadow(color: Color.black.opacity(0.28), radius: 4, y: 1)
+            .position(position(for: corner))
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        if zoomSession == nil {
+                            zoomSession = PreviewCropZoomSession(corner: corner, initialRect: effectiveCropRect)
+                        }
+
+                        guard let zoomSession else { return }
+                        cropRect = zoomedRect(for: zoomSession, translation: value.translation)
+                    }
+                    .onEnded { _ in
+                        zoomSession = nil
+                    }
+            )
+    }
+
+    private func position(for corner: PreviewCropZoomCorner) -> CGPoint {
+        switch corner {
+        case .topLeading:
+            return CGPoint(x: handleInset, y: handleInset)
+        case .topTrailing:
+            return CGPoint(x: max(canvasSize.width - handleInset, handleInset), y: handleInset)
+        case .bottomLeading:
+            return CGPoint(x: handleInset, y: max(canvasSize.height - handleInset, handleInset))
+        case .bottomTrailing:
+            return CGPoint(
+                x: max(canvasSize.width - handleInset, handleInset),
+                y: max(canvasSize.height - handleInset, handleInset)
+            )
+        }
+    }
+
+    private func updatedRect(for session: PreviewCropPanSession, translation: CGSize) -> CGRect {
+        let sourceWidth = max(sourceAspectRatio, 0.001)
+        let cropWidth = max(session.initialRect.width * sourceWidth, 0.001)
+        let cropHeight = max(session.initialRect.height, 0.001)
+        let scale = min(canvasSize.width / cropWidth, canvasSize.height / cropHeight)
+        let normalizedDX = translation.width / max(sourceWidth * scale, 0.001)
+        let normalizedDY = translation.height / max(scale, 0.001)
+
+        var moved = session.initialRect
+        moved.origin.x = session.initialRect.origin.x - normalizedDX
+        moved.origin.y = session.initialRect.origin.y - normalizedDY
+        moved.origin.x = min(max(moved.origin.x, 0), 1 - moved.width)
+        moved.origin.y = min(max(moved.origin.y, 0), 1 - moved.height)
+        return moved
+    }
+
+    private func zoomedRect(for session: PreviewCropZoomSession, translation: CGSize) -> CGRect {
+        let normalizedRatio = max(canvasAspectRatio / max(sourceAspectRatio, 0.001), 0.001)
+        let center = CGPoint(x: session.initialRect.midX, y: session.initialRect.midY)
+        let horizontalDirection: CGFloat = session.corner.isTrailing ? 1 : -1
+        let verticalDirection: CGFloat = session.corner.isBottom ? 1 : -1
+        let horizontalProgress = (translation.width * horizontalDirection) / max(canvasSize.width, 1)
+        let verticalProgress = (translation.height * verticalDirection) / max(canvasSize.height, 1)
+        let outwardProgress = (horizontalProgress + verticalProgress) * 0.5
+        let scaleFactor = max(0.2, 1.0 + outwardProgress)
+
+        var newWidth = session.initialRect.width * scaleFactor
+        var newHeight = newWidth / normalizedRatio
+
+        let minWidth: CGFloat = 0.08
+        let minHeight: CGFloat = max(minWidth / normalizedRatio, 0.08)
+        newWidth = max(newWidth, minWidth)
+        newHeight = max(newHeight, minHeight)
+
+        if newWidth > 1.0 {
+            newWidth = 1.0
+            newHeight = newWidth / normalizedRatio
+        }
+        if newHeight > 1.0 {
+            newHeight = 1.0
+            newWidth = newHeight * normalizedRatio
+        }
+
+        var resized = CGRect(
+            x: center.x - (newWidth * 0.5),
+            y: center.y - (newHeight * 0.5),
+            width: newWidth,
+            height: newHeight
+        )
+        resized.origin.x = min(max(resized.origin.x, 0), 1 - resized.width)
+        resized.origin.y = min(max(resized.origin.y, 0), 1 - resized.height)
+        return CanvasCropMath.fittedNormalizedCropRect(
+            resized,
+            sourceAspect: sourceAspectRatio,
+            canvasAspect: canvasAspectRatio
+        )
+    }
+}
+
+private struct PreviewPlayerLayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> PreviewPlayerNSView {
+        let view = PreviewPlayerNSView()
+        view.playerLayer.player = player
+        return view
+    }
+
+    func updateNSView(_ nsView: PreviewPlayerNSView, context: Context) {
+        nsView.playerLayer.player = player
+    }
+}
+
+private final class PreviewPlayerNSView: NSView {
+    let playerLayer = AVPlayerLayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        playerLayer.videoGravity = .resizeAspect
+        layer?.addSublayer(playerLayer)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        playerLayer.frame = bounds
+    }
+}
+
+private struct PreviewCropPanSession {
+    let initialRect: CGRect
+}
+
+private struct PreviewCropZoomSession {
+    let corner: PreviewCropZoomCorner
+    let initialRect: CGRect
+}
+
+private enum PreviewCropZoomCorner: CaseIterable {
+    case topLeading
+    case topTrailing
+    case bottomLeading
+    case bottomTrailing
+
+    var isTrailing: Bool {
+        switch self {
+        case .topTrailing, .bottomTrailing:
+            return true
+        case .topLeading, .bottomLeading:
+            return false
+        }
+    }
+
+    var isBottom: Bool {
+        switch self {
+        case .bottomLeading, .bottomTrailing:
+            return true
+        case .topLeading, .topTrailing:
+            return false
+        }
     }
 }
 

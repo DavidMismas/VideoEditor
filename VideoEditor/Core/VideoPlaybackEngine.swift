@@ -31,6 +31,7 @@ class VideoPlaybackEngine {
     var currentTime: Double = 0
     var duration: Double = 0
     var isPlaying: Bool = false
+    var presentationSize: CGSize = .zero
     
     // Custom video compositor reference
     private var videoComposition: AVVideoComposition?
@@ -82,6 +83,7 @@ class VideoPlaybackEngine {
                 self.duration = durationSeconds
                 self.currentTime = 0
                 self.isPlaying = false
+                self.presentationSize = item.presentationSize
                 await self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
             } catch {
                 print("Failed to load asset: \(error)")
@@ -170,6 +172,7 @@ class VideoPlaybackEngine {
             
             if let currentItem = self.player.currentItem, currentItem.duration.isNumeric {
                 self.duration = max(currentItem.duration.seconds, 0)
+                self.presentationSize = currentItem.presentationSize
             }
         }
     }

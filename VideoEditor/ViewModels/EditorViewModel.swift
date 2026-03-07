@@ -67,9 +67,14 @@ class EditorViewModel {
                 clipEditorSegments[0].duration = isolated.duration
                 clipEditorSegments[0].appliedLUTID = isolated.appliedLUTID
                 clipEditorSegments[0].adjustments = isolated.adjustments
+                clipEditorSegments[0].transforms = isolated.transforms
             } else if oldValue?.appliedLUTID != isolated.appliedLUTID {
                 for index in clipEditorSegments.indices {
                     clipEditorSegments[index].appliedLUTID = isolated.appliedLUTID
+                }
+            } else if oldValue?.transforms != isolated.transforms {
+                for index in clipEditorSegments.indices {
+                    clipEditorSegments[index].transforms = isolated.transforms
                 }
             }
 
@@ -243,6 +248,74 @@ class EditorViewModel {
         engine.loadMedia(from: url)
         engine.currentAdjustments = clip.adjustments
         engine.currentLUTURL = lutURL(for: clip.appliedLUTID)
+    }
+
+    var activePreviewClip: TimelineClip? {
+        if let isolatedClip {
+            return isolatedClip
+        }
+        guard let selectedClipId else { return nil }
+        return findClip(id: selectedClipId)
+    }
+
+    var activePreviewClipID: UUID? {
+        activePreviewClip?.id
+    }
+
+    var activePreviewTransforms: Transforms {
+        activePreviewClip?.transforms ?? Transforms()
+    }
+
+    var canvasOrientation: CanvasOrientation {
+        get { config.canvasOrientation }
+        set { config.canvasOrientation = newValue }
+    }
+
+    var canvasAspectRatio: CGFloat {
+        config.canvasOrientation.aspectRatio
+    }
+
+    var previewSourceAspectRatio: CGFloat {
+        let size = engine.presentationSize
+        guard size.width > 1, size.height > 1 else { return canvasAspectRatio }
+        return max(size.width / size.height, 0.001)
+    }
+
+    func toggleCanvasOrientation() {
+        config.canvasOrientation = config.canvasOrientation == .portrait ? .landscape : .portrait
+    }
+
+    func updateTransforms(for id: UUID?, _ newTransforms: Transforms) {
+        guard let id else { return }
+
+        for trackIndex in videoTracks.indices {
+            if let clipIndex = videoTracks[trackIndex].clips.firstIndex(where: { $0.id == id }) {
+                videoTracks[trackIndex].clips[clipIndex].transforms = newTransforms
+                break
+            }
+        }
+
+        if isolatedClip?.id == id {
+            isolatedClip?.transforms = newTransforms
+            for index in clipEditorSegments.indices {
+                clipEditorSegments[index].transforms = newTransforms
+            }
+        }
+    }
+
+    func setActivePreviewCropRect(_ rect: CGRect?) {
+        guard let clipID = activePreviewClipID else { return }
+        var transforms = activePreviewTransforms
+        transforms.cropRect = rect
+        updateTransforms(for: clipID, transforms)
+    }
+
+    func resetActivePreviewCropRect() {
+        setActivePreviewCropRect(nil)
+    }
+
+    func effectiveExportResolution(for resolution: ExportResolution) -> CGSize {
+        config.canvasOrientation.applied(to: resolution.size)
     }
     
     func updateAdjustments(for id: UUID?, _ newAdjustments: ColorAdjustments) {
@@ -479,7 +552,7 @@ class EditorViewModel {
     ) async throws {
         var exportConfig = config
         exportConfig.frameRate = frameRate.rawValue
-        exportConfig.resolution = resolution.size
+        exportConfig.resolution = effectiveExportResolution(for: resolution)
         
         try await TimelineExporter.shared.export(
             videoTracks: videoTracks,

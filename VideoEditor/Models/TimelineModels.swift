@@ -1,5 +1,38 @@
 import Foundation
 import CoreMedia
+import CoreGraphics
+
+enum CanvasOrientation: String, CaseIterable {
+    case landscape
+    case portrait
+
+    var aspectRatio: CGFloat {
+        switch self {
+        case .landscape:
+            return 16.0 / 9.0
+        case .portrait:
+            return 9.0 / 16.0
+        }
+    }
+
+    var previewSymbolName: String {
+        switch self {
+        case .landscape:
+            return "rectangle"
+        case .portrait:
+            return "rectangle.portrait"
+        }
+    }
+
+    func applied(to size: CGSize) -> CGSize {
+        switch self {
+        case .landscape:
+            return size.width >= size.height ? size : CGSize(width: size.height, height: size.width)
+        case .portrait:
+            return size.height >= size.width ? size : CGSize(width: size.height, height: size.width)
+        }
+    }
+}
 
 struct TimelineClip: Identifiable {
     let id: UUID = UUID()
@@ -28,4 +61,5 @@ struct TimelineTrack: Identifiable {
 struct ProjectConfig {
     var resolution: CGSize = CGSize(width: 1920, height: 1080)
     var frameRate: Int = 30
+    var canvasOrientation: CanvasOrientation = .landscape
 }

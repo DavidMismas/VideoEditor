@@ -12,6 +12,7 @@ final class TimelineExporter {
         let timeRange: CMTimeRange
         let adjustments: ColorAdjustments
         let lutURL: URL?
+        let transforms: Transforms
     }
     
     private final class TranscodeContext: @unchecked Sendable {
@@ -357,7 +358,6 @@ final class TimelineExporter {
                 composition.naturalSize = Self.orientedSize(for: naturalSize, preferredTransform: preferredTransform)
                 preferredTransformSet = true
             }
-            
             if !clip.isMuted,
                let sourceAudioTrack = try await asset.loadTracks(withMediaType: .audio).first,
                let primaryAudioTrack {
@@ -369,7 +369,8 @@ final class TimelineExporter {
                 ClipSegment(
                     timeRange: segmentTimeRange,
                     adjustments: clip.adjustments,
-                    lutURL: clip.appliedLUTID.flatMap { lutMap[$0] }
+                    lutURL: clip.appliedLUTID.flatMap { lutMap[$0] },
+                    transforms: clip.transforms
                 )
             )
             timelineCursor = CMTimeAdd(timelineCursor, finalDuration)
@@ -436,6 +437,7 @@ final class TimelineExporter {
             })
             let clipAdjustments = clipSegment?.adjustments ?? defaultAdjustments
             let clipLUTURL = clipSegment?.lutURL
+            let clipTransforms = clipSegment?.transforms ?? Transforms()
             let filtered = exportProcessor.applyAdjustments(
                 clipAdjustments,
                 lutURL: clipLUTURL,
@@ -443,8 +445,8 @@ final class TimelineExporter {
                 renderQuality: .export,
                 to: params.sourceImage
             )
-            let fitted = Self.aspectFit(filtered, into: targetRenderSize)
-            return AVCIImageFilteringResult(resultImage: fitted)
+            let cropped = Self.applyCanvasCrop(clipTransforms.cropRect, to: filtered, renderSize: targetRenderSize)
+            return AVCIImageFilteringResult(resultImage: cropped)
         })
         
         var videoConfiguration = try await AVVideoComposition.Configuration(for: composition)
@@ -471,35 +473,51 @@ final class TimelineExporter {
         )
     }
     
-    nonisolated private static func aspectFit(_ image: CIImage, into renderSize: CGSize) -> CIImage {
+    nonisolated private static func applyCanvasCrop(_ normalizedCropRect: CGRect?, to image: CIImage, renderSize: CGSize) -> CIImage {
         guard renderSize.width > 1, renderSize.height > 1 else { return image }
-        
+
         let sourceExtent = image.extent.standardized
         guard sourceExtent.width > 1, sourceExtent.height > 1 else { return image }
-        
-        let targetRect = CGRect(origin: .zero, size: renderSize)
-        let normalized = image.transformed(by: CGAffineTransform(
-            translationX: -sourceExtent.origin.x,
-            y: -sourceExtent.origin.y
-        ))
-        
-        let scale = min(
-            renderSize.width / sourceExtent.width,
-            renderSize.height / sourceExtent.height
+
+        let sourceAspect = sourceExtent.width / sourceExtent.height
+        let canvasAspect = renderSize.width / renderSize.height
+        let fittedCrop = CanvasCropMath.fittedNormalizedCropRect(
+            normalizedCropRect,
+            sourceAspect: sourceAspect,
+            canvasAspect: canvasAspect
         )
-        let scaledWidth = sourceExtent.width * scale
-        let scaledHeight = sourceExtent.height * scale
-        let xOffset = (renderSize.width - scaledWidth) * 0.5
-        let yOffset = (renderSize.height - scaledHeight) * 0.5
-        
-        let fitted = normalized
+
+        let clamped = CGRect(
+            x: min(max(fittedCrop.origin.x, 0), 1),
+            y: min(max(fittedCrop.origin.y, 0), 1),
+            width: min(max(fittedCrop.size.width, 0.05), 1),
+            height: min(max(fittedCrop.size.height, 0.05), 1)
+        )
+        let maxX = min(clamped.maxX, 1)
+        let maxY = min(clamped.maxY, 1)
+        let cropRect = CGRect(
+            x: sourceExtent.minX + (clamped.minX * sourceExtent.width),
+            y: sourceExtent.minY + (clamped.minY * sourceExtent.height),
+            width: max((maxX - clamped.minX) * sourceExtent.width, 1),
+            height: max((maxY - clamped.minY) * sourceExtent.height, 1)
+        ).integral
+
+        guard cropRect.width > 1, cropRect.height > 1 else { return image }
+
+        let cropped = image.cropped(to: cropRect)
+        let scale = max(renderSize.width / cropRect.width, renderSize.height / cropRect.height)
+        let scaled = cropped
+            .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
             .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            .transformed(by: CGAffineTransform(translationX: xOffset, y: yOffset))
-        
+
+        let xOffset = (renderSize.width - (cropRect.width * scale)) * 0.5
+        let yOffset = (renderSize.height - (cropRect.height * scale)) * 0.5
+        let translated = scaled.transformed(by: CGAffineTransform(translationX: xOffset, y: yOffset))
+        let targetRect = CGRect(origin: .zero, size: renderSize)
         let background = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 1))
             .cropped(to: targetRect)
-        
-        return fitted
+
+        return translated
             .composited(over: background)
             .cropped(to: targetRect)
     }
