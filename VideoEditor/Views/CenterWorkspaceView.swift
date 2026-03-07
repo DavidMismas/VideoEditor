@@ -11,15 +11,16 @@ struct CenterWorkspaceView: View {
         GeometryReader { geo in
             let spacing: CGFloat = 8
             let availableHeight = max(geo.size.height - (spacing * 2), 300)
-            let previewHeight = availableHeight * 0.5
-            let timelineSectionHeight = availableHeight * 0.25
+            let previewHeight = availableHeight * 0.60
+            let clipEditorHeight = availableHeight * 0.15
+            let timelineSectionHeight = max(availableHeight - previewHeight - clipEditorHeight, 120)
             
             VStack(spacing: spacing) {
                 LivePreviewView(viewModel: viewModel)
                     .frame(height: previewHeight)
                 
                 ActiveClipEditorView(viewModel: viewModel)
-                    .frame(height: timelineSectionHeight)
+                    .frame(height: clipEditorHeight)
                 
                 MasterTimelineView(viewModel: viewModel)
                     .frame(height: timelineSectionHeight)
@@ -37,11 +38,18 @@ struct LivePreviewView: View {
     @State private var isPortrait = false
     
     var body: some View {
-        VStack {
+        VStack(spacing: 0) {
             HStack {
                 Text("Live Preview")
                     .foregroundColor(Theme.textSecondary)
                 Spacer()
+
+                Button(action: { viewModel.engine.togglePlayPause() }) {
+                    Image(systemName: viewModel.engine.isPlaying ? "pause.fill" : "play.fill")
+                        .foregroundColor(Theme.textMain)
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 6)
                 
                 Button(action: { isPortrait.toggle() }) {
                     Image(systemName: isPortrait ? "rectangle.portrait" : "rectangle")
@@ -71,17 +79,6 @@ struct LivePreviewView: View {
                     Text("Select a clip or play the timeline to display preview")
                         .foregroundColor(Color(white: 0.3))
                 }
-            }
-            
-            // Controls
-            HStack {
-                Button(action: { viewModel.engine.togglePlayPause() }) {
-                    Image(systemName: viewModel.engine.player.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.title3)
-                        .foregroundColor(Theme.textMain)
-                }
-                .buttonStyle(.plain)
-                .padding()
             }
         }
         .background(Color(white: 0.1))
@@ -196,13 +193,14 @@ struct ActiveClipEditorView: View {
                 }
             }
             .padding(.horizontal, 8)
-            .padding(.top, 6)
+            .padding(.top, 4)
+            .padding(.bottom, 4)
             
             ZStack {
                 Theme.panelBackground.opacity(0.5)
                 
                 if viewModel.isolatedClip != nil {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
                         GeometryReader { geo in
                             let segments = viewModel.clipEditorSegments
                             let occupiedDuration = max(viewModel.clipEditorTotalDurationSeconds(), 0.01)
@@ -233,7 +231,7 @@ struct ActiveClipEditorView: View {
                                         trimEnabled: viewModel.clipEditorTrimModeEnabled && !viewModel.clipEditorSplitModeEnabled,
                                         dragEnabled: !viewModel.clipEditorTrimModeEnabled && !viewModel.clipEditorSplitModeEnabled
                                     )
-                                    .offset(x: left, y: 9)
+                                    .offset(x: left, y: 6)
                                 }
                             }
                             .coordinateSpace(name: clipEditorTrimCoordinateSpace)
@@ -253,9 +251,11 @@ struct ActiveClipEditorView: View {
                                 updateSplitCursor(inside: inside)
                             }
                         }
-                        .frame(height: 90)
+                        .frame(height: 74)
                     }
-                    .padding(10)
+                    .padding(.horizontal, 8)
+                    .padding(.top, 4)
+                    .padding(.bottom, 6)
                 } else if let _ = viewModel.selectedClipId {
                     // Support legacy selected clip logic, though isolatedItem is preferred now
                     HStack(spacing: 0) {
@@ -329,8 +329,8 @@ struct ActiveClipEditorView: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundColor(Theme.textSecondary)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
                 .background(Theme.panelBackground.opacity(0.7))
             }
         }

@@ -30,6 +30,7 @@ class VideoPlaybackEngine {
     var player: AVPlayer = AVPlayer()
     var currentTime: Double = 0
     var duration: Double = 0
+    var isPlaying: Bool = false
     
     // Custom video compositor reference
     private var videoComposition: AVVideoComposition?
@@ -80,6 +81,7 @@ class VideoPlaybackEngine {
                 self.player.replaceCurrentItem(with: item)
                 self.duration = durationSeconds
                 self.currentTime = 0
+                self.isPlaying = false
                 await self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
             } catch {
                 print("Failed to load asset: \(error)")
@@ -108,13 +110,16 @@ class VideoPlaybackEngine {
     func togglePlayPause() {
         if player.isPlaying {
             player.pause()
+            isPlaying = false
         } else {
             player.play()
+            isPlaying = true
         }
     }
     
     func pause() {
         player.pause()
+        isPlaying = false
     }
     
     func seek(to seconds: Double, shouldPause: Bool = true) {
@@ -125,6 +130,7 @@ class VideoPlaybackEngine {
         
         if shouldPause {
             player.pause()
+            isPlaying = false
         }
         
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
@@ -160,6 +166,7 @@ class VideoPlaybackEngine {
             if time.isNumeric {
                 self.currentTime = max(0, time.seconds)
             }
+            self.isPlaying = self.player.isPlaying
             
             if let currentItem = self.player.currentItem, currentItem.duration.isNumeric {
                 self.duration = max(currentItem.duration.seconds, 0)
