@@ -28,6 +28,8 @@ class EditorViewModel {
     var clipEditorSegments: [TimelineClip] = []
     var clipEditorReferenceDurationSeconds: Double = 0
     var clipEditorSplitModeEnabled: Bool = false
+    var clipEditorTrimModeEnabled: Bool = false
+    var activeClipEditorDragSession: ClipDragSession?
     
     var isolatedClip: TimelineClip? {
         didSet {
@@ -38,6 +40,8 @@ class EditorViewModel {
                     clipEditorSegments = []
                     clipEditorReferenceDurationSeconds = 0
                     clipEditorSplitModeEnabled = false
+                    clipEditorTrimModeEnabled = false
+                    activeClipEditorDragSession = nil
                 }
                 return
             }
@@ -47,22 +51,35 @@ class EditorViewModel {
             let clipChanged = oldValue?.id != isolated.id || oldValue?.mediaItem.url != isolated.mediaItem.url
             if clipChanged, let url = isolated.mediaItem.url {
                 engine.loadMedia(from: url)
-                clipEditorSegments = [isolated]
+                clipEditorSegments = [makeClipEditorRootSegment(from: isolated)]
                 clipEditorReferenceDurationSeconds = max(
                     sourceDurationSeconds(for: isolated),
                     max(isolated.duration.seconds, minimumEditorSegmentDurationSeconds)
                 )
             } else if clipEditorSegments.isEmpty {
-                clipEditorSegments = [isolated]
+                clipEditorSegments = [makeClipEditorRootSegment(from: isolated)]
                 clipEditorReferenceDurationSeconds = max(
                     sourceDurationSeconds(for: isolated),
                     max(isolated.duration.seconds, minimumEditorSegmentDurationSeconds)
                 )
+            } else if clipEditorSegments.count == 1, clipEditorSegments[0].mediaItem.id == isolated.mediaItem.id {
+                clipEditorSegments[0].startTime = isolated.startTime
+                clipEditorSegments[0].duration = isolated.duration
+                clipEditorSegments[0].appliedLUTID = isolated.appliedLUTID
+                clipEditorSegments[0].adjustments = isolated.adjustments
             } else if oldValue?.appliedLUTID != isolated.appliedLUTID {
                 for index in clipEditorSegments.indices {
                     clipEditorSegments[index].appliedLUTID = isolated.appliedLUTID
                 }
             }
+
+            clipEditorReferenceDurationSeconds = max(
+                sourceDurationSeconds(for: isolated),
+                clipEditorTotalDurationSeconds(),
+                minimumEditorSegmentDurationSeconds
+            )
+
+            activeClipEditorDragSession = nil
             
             engine.currentAdjustments = isolated.adjustments
             engine.currentLUTURL = lutURL(for: isolated.appliedLUTID)
@@ -113,6 +130,7 @@ class EditorViewModel {
     
     private let fallbackClipDurationSeconds: Double = 5.0
     private let minimumEditorSegmentDurationSeconds: Double = 0.10
+    private let clipEditorInteractionDebugLogging = true
     
     // MARK: - Intents
     
@@ -160,6 +178,7 @@ class EditorViewModel {
             mediaItem: clip.mediaItem,
             startTime: clip.startTime,
             duration: clip.duration,
+            timelineStart: clip.timelineStart,
             appliedLUTID: clip.appliedLUTID,
             adjustments: clip.adjustments,
             transforms: clip.transforms,
@@ -206,7 +225,8 @@ class EditorViewModel {
         TimelineClip(
             mediaItem: item,
             startTime: .zero,
-            duration: resolvedClipDuration(for: item)
+            duration: resolvedClipDuration(for: item),
+            timelineStart: .zero
         )
     }
     
@@ -304,13 +324,16 @@ class EditorViewModel {
     }
     
     func clipEditorTotalDurationSeconds() -> Double {
-        if clipEditorReferenceDurationSeconds.isFinite, clipEditorReferenceDurationSeconds > 0 {
-            return clipEditorReferenceDurationSeconds
+        let total = clipEditorSegments.reduce(0.0) { partial, segment in
+            max(partial, clipEditorTimelineStartSeconds(for: segment.id) + clipEditorSegmentDurationSeconds(segment))
         }
-        let fallback = clipEditorSegments
-            .map { max(0.0, $0.startTime.seconds) + clipEditorSegmentDurationSeconds($0) }
-            .max() ?? 0
-        return max(fallback, minimumEditorSegmentDurationSeconds)
+        return max(total, clipEditorReferenceDurationSeconds, minimumEditorSegmentDurationSeconds)
+    }
+    
+    func clipEditorTimelineStartSeconds(for id: UUID) -> Double {
+        guard let segment = clipEditorSegments.first(where: { $0.id == id }) else { return 0.0 }
+        let seconds = segment.timelineStart.seconds
+        return seconds.isFinite ? max(seconds, 0.0) : 0.0
     }
     
     func clipEditorSegmentDurationSeconds(_ segment: TimelineClip) -> Double {
@@ -321,62 +344,85 @@ class EditorViewModel {
         return minimumEditorSegmentDurationSeconds
     }
     
-    func trimEditorSegmentLeading(
+    func beginClipEditorInteraction(
         id: UUID,
-        anchorStartSeconds: Double,
-        anchorDurationSeconds: Double,
-        translationSeconds: Double
+        mode: ClipInteractionMode,
+        mouseDownX: CGFloat,
+        transform: ClipEditorTimelineTransform
     ) {
         guard let index = clipEditorSegments.firstIndex(where: { $0.id == id }) else { return }
-        guard index < clipEditorSegments.count else { return }
-        let sourceDuration = max(
-            clipEditorReferenceDurationSeconds,
-            sourceDurationSeconds(for: clipEditorSegments[index])
+        let segment = clipEditorSegments[index]
+        let timelineStart = clipEditorTimelineStartSeconds(for: id)
+        let duration = clipEditorSegmentDurationSeconds(segment)
+        let timelineEnd = timelineStart + duration
+        let inPoint = max(segment.startTime.seconds, 0.0)
+        let outPoint = inPoint + duration
+        let previousClipEnd = clipEditorPreviousEnd(for: id)
+        let nextClipStart = clipEditorNextStart(for: id)
+        let sourceDuration = max(sourceDurationSeconds(for: segment), outPoint, minimumEditorSegmentDurationSeconds)
+
+        activeClipEditorDragSession = ClipDragSession(
+            clipID: id,
+            clipIndex: index,
+            mode: mode,
+            snapshot: ClipInteractionSnapshot(
+                initialClipStart: timelineStart,
+                initialClipEnd: timelineEnd,
+                initialDuration: duration,
+                initialInPoint: inPoint,
+                initialOutPoint: outPoint,
+                initialMouseDownX: mouseDownX
+            ),
+            secondsPerPoint: transform.secondsPerPoint,
+            minimumDuration: minimumEditorSegmentDurationSeconds,
+            minimumStart: max(0.0, previousClipEnd ?? 0.0),
+            maximumEnd: min(nextClipStart ?? clipEditorTotalDurationSeconds(), clipEditorTotalDurationSeconds()),
+            minimumInPoint: 0.0,
+            maximumOutPoint: sourceDuration
         )
-        let minDuration = minimumEditorSegmentDurationSeconds
-        let previousEnd: Double = {
-            guard index > 0 else { return 0.0 }
-            let previous = clipEditorSegments[index - 1]
-            return max(0.0, previous.startTime.seconds) + clipEditorSegmentDurationSeconds(previous)
-        }()
-        let requestedStart = anchorStartSeconds + translationSeconds
-        let maxStart = min(
-            sourceDuration - minDuration,
-            anchorStartSeconds + max(anchorDurationSeconds - minDuration, 0)
-        )
-        let lowerBound = max(0.0, previousEnd)
-        let upperBound = max(lowerBound, max(0.0, maxStart))
-        let clampedStart = clamp(requestedStart, min: lowerBound, max: upperBound)
-        let newDuration = max(minDuration, anchorDurationSeconds - (clampedStart - anchorStartSeconds))
-        clipEditorSegments[index].startTime = CMTime(seconds: clampedStart, preferredTimescale: 600)
-        clipEditorSegments[index].duration = CMTime(seconds: newDuration, preferredTimescale: 600)
+
+        if let session = activeClipEditorDragSession {
+            debugClipEditorInteraction(
+                phase: "begin",
+                session: session,
+                deltaX: 0,
+                update: ClipInteractionUpdate(
+                    start: timelineStart,
+                    end: timelineEnd,
+                    inPoint: inPoint,
+                    outPoint: outPoint
+                )
+            )
+        }
     }
-    
-    func trimEditorSegmentTrailing(
-        id: UUID,
-        anchorStartSeconds: Double,
-        anchorDurationSeconds: Double,
-        translationSeconds: Double
-    ) {
-        guard let index = clipEditorSegments.firstIndex(where: { $0.id == id }) else { return }
-        guard index < clipEditorSegments.count else { return }
-        let sourceDuration = max(
-            clipEditorReferenceDurationSeconds,
-            sourceDurationSeconds(for: clipEditorSegments[index])
-        )
-        let minDuration = minimumEditorSegmentDurationSeconds
-        let nextStart: Double = {
-            guard index + 1 < clipEditorSegments.count else { return sourceDuration }
-            let next = clipEditorSegments[index + 1]
-            return max(0.0, next.startTime.seconds)
-        }()
-        let anchorEnd = anchorStartSeconds + anchorDurationSeconds
-        let requestedEnd = anchorEnd + translationSeconds
-        let minEnd = anchorStartSeconds + minDuration
-        let maxEnd = max(minEnd, min(sourceDuration, nextStart))
-        let clampedEnd = clamp(requestedEnd, min: minEnd, max: maxEnd)
-        let newDuration = max(minDuration, clampedEnd - anchorStartSeconds)
-        clipEditorSegments[index].duration = CMTime(seconds: newDuration, preferredTimescale: 600)
+
+    func updateClipEditorInteraction(currentMouseX: CGFloat) {
+        guard let session = activeClipEditorDragSession else { return }
+        guard session.clipIndex < clipEditorSegments.count else { return }
+
+        let deltaX = currentMouseX - session.snapshot.initialMouseDownX
+        let updatedClip = ClipInteractionEngine.update(session, deltaX: deltaX)
+        applyClipEditorInteractionUpdate(updatedClip, to: session.clipIndex)
+
+        debugClipEditorInteraction(phase: "update", session: session, deltaX: deltaX, update: updatedClip)
+    }
+
+    func endClipEditorInteraction() {
+        if let session = activeClipEditorDragSession, session.clipIndex < clipEditorSegments.count {
+            let segment = clipEditorSegments[session.clipIndex]
+            debugClipEditorInteraction(
+                phase: "end",
+                session: session,
+                deltaX: 0,
+                update: ClipInteractionUpdate(
+                    start: clipEditorTimelineStartSeconds(for: segment.id),
+                    end: clipEditorTimelineStartSeconds(for: segment.id) + clipEditorSegmentDurationSeconds(segment),
+                    inPoint: max(segment.startTime.seconds, 0.0),
+                    outPoint: max(segment.startTime.seconds, 0.0) + clipEditorSegmentDurationSeconds(segment)
+                )
+            )
+        }
+        activeClipEditorDragSession = nil
     }
     
     @discardableResult
@@ -390,14 +436,15 @@ class EditorViewModel {
         
         for index in clipEditorSegments.indices {
             let segment = clipEditorSegments[index]
-            let segmentStart = max(segment.startTime.seconds, 0.0)
+            let timelineStart = clipEditorTimelineStartSeconds(for: segment.id)
+            let sourceStart = max(segment.startTime.seconds, 0.0)
             let duration = clipEditorSegmentDurationSeconds(segment)
-            let end = segmentStart + duration
-            if safeTimeline <= segmentStart || safeTimeline >= end {
+            let end = timelineStart + duration
+            if safeTimeline <= timelineStart || safeTimeline >= end {
                 continue
             }
             
-            let localSplit = safeTimeline - segmentStart
+            let localSplit = safeTimeline - timelineStart
             let minDuration = minimumEditorSegmentDurationSeconds
             guard localSplit > minDuration, (duration - localSplit) > minDuration else {
                 return false
@@ -405,13 +452,15 @@ class EditorViewModel {
             
             let first = makeSegment(
                 from: segment,
-                startSeconds: segmentStart,
-                durationSeconds: localSplit
+                startSeconds: sourceStart,
+                durationSeconds: localSplit,
+                timelineStartSeconds: timelineStart
             )
             let second = makeSegment(
                 from: segment,
-                startSeconds: safeTimeline,
-                durationSeconds: duration - localSplit
+                startSeconds: sourceStart + localSplit,
+                durationSeconds: duration - localSplit,
+                timelineStartSeconds: timelineStart + localSplit
             )
             clipEditorSegments.replaceSubrange(index...index, with: [first, second])
             return true
@@ -443,7 +492,7 @@ class EditorViewModel {
             onProgress: onProgress
         )
     }
-    
+
     private func sourceDurationSeconds(for segment: TimelineClip) -> Double {
         if let mediaDuration = segment.mediaItem.durationSeconds, mediaDuration.isFinite, mediaDuration > 0 {
             return mediaDuration
@@ -453,20 +502,76 @@ class EditorViewModel {
         return max(fallback, occupied)
     }
     
-    private func makeSegment(
-        from source: TimelineClip,
-        startSeconds: Double,
-        durationSeconds: Double
-    ) -> TimelineClip {
+    private func makeClipEditorRootSegment(from source: TimelineClip) -> TimelineClip {
         TimelineClip(
             mediaItem: source.mediaItem,
-            startTime: CMTime(seconds: max(0.0, startSeconds), preferredTimescale: 600),
-            duration: CMTime(seconds: max(minimumEditorSegmentDurationSeconds, durationSeconds), preferredTimescale: 600),
+            startTime: source.startTime,
+            duration: source.duration,
+            timelineStart: .zero,
             appliedLUTID: source.appliedLUTID,
             adjustments: source.adjustments,
             transforms: source.transforms,
             volume: source.volume,
             isMuted: source.isMuted
+        )
+    }
+
+    private func makeSegment(
+        from source: TimelineClip,
+        startSeconds: Double,
+        durationSeconds: Double,
+        timelineStartSeconds: Double
+    ) -> TimelineClip {
+        TimelineClip(
+            mediaItem: source.mediaItem,
+            startTime: CMTime(seconds: max(0.0, startSeconds), preferredTimescale: 600),
+            duration: CMTime(seconds: max(minimumEditorSegmentDurationSeconds, durationSeconds), preferredTimescale: 600),
+            timelineStart: CMTime(seconds: max(0.0, timelineStartSeconds), preferredTimescale: 600),
+            appliedLUTID: source.appliedLUTID,
+            adjustments: source.adjustments,
+            transforms: source.transforms,
+            volume: source.volume,
+            isMuted: source.isMuted
+        )
+    }
+
+    private func clipEditorPreviousEnd(for id: UUID) -> Double? {
+        let sorted = clipEditorSegments.sorted { lhs, rhs in
+            clipEditorTimelineStartSeconds(for: lhs.id) < clipEditorTimelineStartSeconds(for: rhs.id)
+        }
+        guard let index = sorted.firstIndex(where: { $0.id == id }), index > 0 else { return nil }
+        let previous = sorted[index - 1]
+        return clipEditorTimelineStartSeconds(for: previous.id) + clipEditorSegmentDurationSeconds(previous)
+    }
+
+    private func clipEditorNextStart(for id: UUID) -> Double? {
+        let sorted = clipEditorSegments.sorted { lhs, rhs in
+            clipEditorTimelineStartSeconds(for: lhs.id) < clipEditorTimelineStartSeconds(for: rhs.id)
+        }
+        guard let index = sorted.firstIndex(where: { $0.id == id }), index + 1 < sorted.count else { return nil }
+        return clipEditorTimelineStartSeconds(for: sorted[index + 1].id)
+    }
+
+    private func applyClipEditorInteractionUpdate(_ update: ClipInteractionUpdate, to index: Int) {
+        clipEditorSegments[index].timelineStart = CMTime(seconds: update.start, preferredTimescale: 600)
+        clipEditorSegments[index].startTime = CMTime(seconds: update.inPoint, preferredTimescale: 600)
+        clipEditorSegments[index].duration = CMTime(seconds: max(update.duration, minimumEditorSegmentDurationSeconds), preferredTimescale: 600)
+    }
+
+    private func debugClipEditorInteraction(
+        phase: String,
+        session: ClipDragSession,
+        deltaX: CGFloat,
+        update: ClipInteractionUpdate
+    ) {
+        guard clipEditorInteractionDebugLogging else { return }
+        print(
+            "[ClipEditor] phase=\(phase) mode=\(session.mode.rawValue) " +
+            "initialStart=\(String(format: "%.3f", session.snapshot.initialClipStart)) " +
+            "initialEnd=\(String(format: "%.3f", session.snapshot.initialClipEnd)) " +
+            "deltaX=\(String(format: "%.2f", deltaX)) " +
+            "clampedStart=\(String(format: "%.3f", update.start)) " +
+            "clampedEnd=\(String(format: "%.3f", update.end))"
         )
     }
     

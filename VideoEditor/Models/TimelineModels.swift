@@ -6,6 +6,7 @@ struct TimelineClip: Identifiable {
     let mediaItem: MediaItem
     var startTime: CMTime
     var duration: CMTime
+    var timelineStart: CMTime = .zero
     var appliedLUTID: UUID? = nil
     
     // Custom adjustments for this specific clip
