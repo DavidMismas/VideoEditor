@@ -8,12 +8,19 @@ import CoreVideo
 final class TimelineExporter {
     static let shared = TimelineExporter()
     
+    private struct SourceVideoColorProperties {
+        let primaries: String?
+        let transferFunction: String?
+        let yCbCrMatrix: String?
+    }
+
     private struct ClipSegment {
         let timeRange: CMTimeRange
         let adjustments: ColorAdjustments
         let lutURL: URL?
         let transforms: Transforms
         let layerIndex: Int
+        let preferredTransform: CGAffineTransform
     }
     
     private final class TranscodeContext: @unchecked Sendable {
@@ -85,6 +92,7 @@ final class TimelineExporter {
                 videoComposition: build.videoComposition,
                 audioMix: build.audioMix,
                 totalDuration: build.totalDuration,
+                outputColorSpace: build.outputColorSpace,
                 config: config,
                 format: format,
                 quality: quality,
@@ -127,6 +135,7 @@ final class TimelineExporter {
         videoComposition: AVVideoComposition,
         audioMix: AVAudioMix?,
         totalDuration: CMTime,
+        outputColorSpace: ColorSpace,
         config: ProjectConfig,
         format: ExportFormat,
         quality: ExportQuality,
@@ -144,10 +153,9 @@ final class TimelineExporter {
         guard !compositionVideoTracks.isEmpty else {
             throw TimelineExportError.noVideoClips
         }
-
         let readerVideoOutput = AVAssetReaderVideoCompositionOutput(
             videoTracks: compositionVideoTracks,
-            videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
+            videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_64RGBAHalf)]
         )
         readerVideoOutput.videoComposition = videoComposition
         readerVideoOutput.alwaysCopiesSampleData = false
@@ -169,7 +177,8 @@ final class TimelineExporter {
             AVVideoCodecKey: format.videoCodec,
             AVVideoWidthKey: renderWidth,
             AVVideoHeightKey: renderHeight,
-            AVVideoCompressionPropertiesKey: compressionProperties
+            AVVideoCompressionPropertiesKey: compressionProperties,
+            AVVideoColorPropertiesKey: Self.videoColorProperties(for: outputColorSpace)
         ]
         let writerVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         writerVideoInput.expectsMediaDataInRealTime = false
@@ -325,7 +334,7 @@ final class TimelineExporter {
         audioTracks: [TimelineTrack],
         config: ProjectConfig,
         lutLibrary: [LUTItem]
-    ) async throws -> (composition: AVMutableComposition, videoComposition: AVVideoComposition, audioMix: AVAudioMix?, totalDuration: CMTime) {
+    ) async throws -> (composition: AVMutableComposition, videoComposition: AVVideoComposition, audioMix: AVAudioMix?, totalDuration: CMTime, outputColorSpace: ColorSpace) {
         let populatedVideoTracks = videoTracks.enumerated().filter { !$0.element.isAudioOnly && !$0.element.clips.isEmpty }
         guard !populatedVideoTracks.isEmpty else {
             throw TimelineExportError.noVideoClips
@@ -337,6 +346,7 @@ final class TimelineExporter {
         var totalTimelineDuration = CMTime.zero
         var naturalSizeSet = false
         let lutMap = Dictionary(uniqueKeysWithValues: lutLibrary.map { ($0.id, $0.url) })
+        var compositionTrackTransforms: [CMPersistentTrackID: CGAffineTransform] = [:]
 
         struct AudioMixLane {
             let track: AVMutableCompositionTrack
@@ -371,6 +381,7 @@ final class TimelineExporter {
                 guard let sourceVideoTrack = try await asset.loadTracks(withMediaType: .video).first else {
                     continue
                 }
+                let preferredTransform = try await sourceVideoTrack.load(.preferredTransform)
 
                 let sourceDuration = try await asset.load(.duration)
                 guard sourceDuration.isNumeric else { continue }
@@ -386,10 +397,17 @@ final class TimelineExporter {
                 let sourceRange = CMTimeRange(start: sourceStart, duration: finalDuration)
 
                 try compositionVideoTrack.insertTimeRange(sourceRange, of: sourceVideoTrack, at: laneCursor)
+                if laneCursor == .zero {
+                    compositionVideoTrack.preferredTransform = preferredTransform
+                    compositionTrackTransforms[compositionVideoTrack.trackID] = preferredTransform
+                }
 
                 if !naturalSizeSet {
                     let naturalSize = try await sourceVideoTrack.load(.naturalSize)
-                    composition.naturalSize = naturalSize
+                    composition.naturalSize = Self.displaySize(
+                        for: naturalSize,
+                        preferredTransform: preferredTransform
+                    )
                     naturalSizeSet = true
                 }
 
@@ -410,7 +428,8 @@ final class TimelineExporter {
                         adjustments: clip.adjustments,
                         lutURL: clip.appliedLUTID.flatMap { lutMap[$0] },
                         transforms: clip.transforms,
-                        layerIndex: layerIndex
+                        layerIndex: layerIndex,
+                        preferredTransform: preferredTransform
                     )
                 )
                 laneCursor = CMTimeAdd(laneCursor, finalDuration)
@@ -482,7 +501,6 @@ final class TimelineExporter {
             return mix
         }()
 
-        let exportProcessor = CoreImageProcessor.shared
         let clipMap = clipSegments
         let defaultAdjustments = ColorAdjustments()
         let targetRenderSize = config.resolution
@@ -491,98 +509,213 @@ final class TimelineExporter {
             composition.naturalSize = targetRenderSize
         }
         
-        let baseVideoComposition = try await AVVideoComposition(applyingFiltersTo: composition, applier: { params in
-            let compositionTime = params.compositionTime
-            let clipSegment = clipMap
-                .filter { segment in
-                guard segment.timeRange.start.isNumeric,
-                      segment.timeRange.duration.isNumeric,
-                      segment.timeRange.duration > .zero,
-                      compositionTime.isNumeric
-                else {
-                    return false
-                }
-                let start = segment.timeRange.start
-                let end = CMTimeAdd(start, segment.timeRange.duration)
-                return CMTimeCompare(compositionTime, start) >= 0 && CMTimeCompare(compositionTime, end) < 0
-                }
-                .max(by: { lhs, rhs in lhs.layerIndex < rhs.layerIndex })
-            let clipAdjustments = clipSegment?.adjustments ?? defaultAdjustments
-            let clipLUTURL = clipSegment?.lutURL
-            let clipTransforms = clipSegment?.transforms ?? Transforms()
-            let filtered = exportProcessor.applyAdjustments(
-                clipAdjustments,
-                lutURL: clipLUTURL,
-                timeSeconds: compositionTime.isNumeric ? compositionTime.seconds : nil,
-                renderQuality: .export,
-                to: params.sourceImage
-            )
-            let cropped = Self.applyCanvasCrop(clipTransforms.cropRect, to: filtered, renderSize: targetRenderSize)
-            return AVCIImageFilteringResult(resultImage: cropped)
-        })
-        
-        var videoConfiguration = try await AVVideoComposition.Configuration(for: composition)
-        videoConfiguration.instructions = Self.makeIdentityTransformInstructions(
-            for: composition.tracks(withMediaType: .video),
-            duration: totalTimelineDuration
-        )
-        videoConfiguration.customVideoCompositorClass = baseVideoComposition.customVideoCompositorClass
-        videoConfiguration.sourceSampleDataTrackIDs = baseVideoComposition.sourceSampleDataTrackIDs
         let safeFrameRate = max(config.frameRate, 1)
-        videoConfiguration.renderSize = config.resolution
-        videoConfiguration.frameDuration = CMTime(value: 1, timescale: CMTimeScale(safeFrameRate))
-        videoConfiguration.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
+        let compositionVideoTracks = composition.tracks(withMediaType: .video)
+
+        let videoComposition: AVVideoComposition
+        if populatedVideoTracks.count == 1 {
+            videoComposition = try await Self.makeFilteredVideoComposition(for: composition) { request in
+                let compositionTime = request.compositionTime
+                let clipSegment = clipMap
+                    .filter { segment in
+                        guard segment.timeRange.start.isNumeric,
+                              segment.timeRange.duration.isNumeric,
+                              segment.timeRange.duration > .zero,
+                              compositionTime.isNumeric
+                        else {
+                            return false
+                        }
+                        let start = segment.timeRange.start
+                        let end = CMTimeAdd(start, segment.timeRange.duration)
+                        return CMTimeCompare(compositionTime, start) >= 0 && CMTimeCompare(compositionTime, end) < 0
+                    }
+                    .max(by: { lhs, rhs in lhs.layerIndex < rhs.layerIndex })
+                let clipAdjustments = clipSegment?.adjustments ?? defaultAdjustments
+                let clipLUTURL = clipSegment?.lutURL
+                let clipTransforms = clipSegment?.transforms ?? Transforms()
+                let clipPreferredTransform = clipSegment?.preferredTransform
+                let filtered = CoreImageProcessor.shared.applyAdjustments(
+                    clipAdjustments,
+                    lutURL: clipLUTURL,
+                    timeSeconds: compositionTime.isNumeric ? compositionTime.seconds : nil,
+                    renderQuality: .export,
+                    to: request.sourceImage
+                )
+                let cropped = Self.applyCanvasCrop(
+                    clipTransforms.cropRect,
+                    to: filtered,
+                    renderSize: targetRenderSize,
+                    preferredTransform: clipPreferredTransform
+                )
+                request.finish(
+                    with: cropped,
+                    context: CoreImageProcessor.shared.renderContext(for: clipAdjustments)
+                )
+            }
+        } else {
+            // AVVideoComposition(applyingFiltersTo:) installs AVCoreImageFilter instructions internally.
+            // Replacing those instructions with standard AVVideoCompositionInstruction objects crashes playback.
+            var videoConfiguration = try await AVVideoComposition.Configuration(for: composition)
+            videoConfiguration.instructions = Self.makeIdentityTransformInstructions(
+                for: compositionVideoTracks,
+                transforms: compositionTrackTransforms,
+                duration: totalTimelineDuration
+            )
+            videoConfiguration.renderSize = targetRenderSize
+            videoConfiguration.frameDuration = CMTime(value: 1, timescale: CMTimeScale(safeFrameRate))
+            videoConfiguration.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
+            videoComposition = AVVideoComposition(configuration: videoConfiguration)
+        }
         
-        let videoComposition = AVVideoComposition(configuration: videoConfiguration)
-        
-        return (composition, videoComposition, audioMix, totalTimelineDuration)
+        let outputColorSpace = clipSegments.first.map { ColorSpace($0.adjustments.outputColorSpace) } ?? .rec709
+        return (composition, videoComposition, audioMix, totalTimelineDuration, outputColorSpace)
     }
 
     nonisolated private static func makeIdentityTransformInstructions(
         for videoTracks: [AVAssetTrack],
+        transforms: [CMPersistentTrackID: CGAffineTransform],
         duration: CMTime
     ) -> [AVVideoCompositionInstructionProtocol] {
         let layerInstructions: [AVVideoCompositionLayerInstruction] = videoTracks.reversed().map { track in
-            let instruction = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-            instruction.setTransform(.identity, at: .zero)
-            return instruction
+            var configuration = AVVideoCompositionLayerInstruction.Configuration(assetTrack: track)
+            configuration.setTransform(transforms[track.trackID] ?? .identity, at: .zero)
+            return AVVideoCompositionLayerInstruction(configuration: configuration)
         }
 
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
-        instruction.layerInstructions = layerInstructions
-        instruction.enablePostProcessing = true
-        return [instruction]
+        let configuration = AVVideoCompositionInstruction.Configuration(
+            backgroundColor: nil,
+            enablePostProcessing: true,
+            layerInstructions: layerInstructions,
+            requiredSourceSampleDataTrackIDs: [],
+            timeRange: CMTimeRange(start: .zero, duration: duration)
+        )
+        return [AVVideoCompositionInstruction(configuration: configuration)]
+    }
+
+    nonisolated private static func makeFilteredVideoComposition(
+        for asset: AVAsset,
+        handler: @escaping @Sendable (AVAsynchronousCIImageFilteringRequest) -> Void
+    ) async throws -> AVVideoComposition {
+        let sourceColorProperties = try await loadSourceColorProperties(for: asset)
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<AVVideoComposition, Error>) in
+            AVMutableVideoComposition.videoComposition(
+                with: asset,
+                applyingCIFiltersWithHandler: handler,
+                completionHandler: { composition, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    guard let composition else {
+                        continuation.resume(
+                            throwing: NSError(
+                                domain: "TimelineExporter",
+                                code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: "AVVideoComposition returned no composition."]
+                            )
+                        )
+                        return
+                    }
+                    if let sourceColorProperties {
+                        composition.colorPrimaries = sourceColorProperties.primaries
+                        composition.colorTransferFunction = sourceColorProperties.transferFunction
+                        composition.colorYCbCrMatrix = sourceColorProperties.yCbCrMatrix
+                    }
+                    continuation.resume(returning: composition)
+                }
+            )
+        }
+    }
+
+    nonisolated private static func loadSourceColorProperties(
+        for asset: AVAsset
+    ) async throws -> SourceVideoColorProperties? {
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        return try await sourceColorProperties(from: tracks)
+    }
+
+    nonisolated private static func sourceColorProperties(
+        from tracks: [AVAssetTrack]
+    ) async throws -> SourceVideoColorProperties? {
+        for track in tracks {
+            let formatDescriptions = try await track.load(.formatDescriptions)
+            guard let properties = sourceColorProperties(from: formatDescriptions) else {
+                continue
+            }
+            return properties
+        }
+
+        return nil
+    }
+
+    nonisolated private static func sourceColorProperties(
+        from formatDescriptions: [CMFormatDescription]
+    ) -> SourceVideoColorProperties? {
+        for formatDescription in formatDescriptions {
+            let extensions = (CMFormatDescriptionGetExtensions(formatDescription) as NSDictionary?) as? [String: Any] ?? [:]
+            let primaries = extensions[kCVImageBufferColorPrimariesKey as String] as? String
+            let transferFunction = extensions[kCVImageBufferTransferFunctionKey as String] as? String
+            let yCbCrMatrix = extensions[kCVImageBufferYCbCrMatrixKey as String] as? String
+
+            if primaries != nil || transferFunction != nil || yCbCrMatrix != nil {
+                return SourceVideoColorProperties(
+                    primaries: primaries,
+                    transferFunction: transferFunction,
+                    yCbCrMatrix: yCbCrMatrix
+                )
+            }
+        }
+
+        return nil
+    }
+
+    nonisolated private static func displaySize(for naturalSize: CGSize, preferredTransform: CGAffineTransform) -> CGSize {
+        let displayRect = CGRect(origin: .zero, size: naturalSize)
+            .applying(preferredTransform)
+            .standardized
+        return CGSize(width: abs(displayRect.width), height: abs(displayRect.height))
+    }
+
+    nonisolated private static func videoColorProperties(for outputColorSpace: ColorSpace) -> [String: String] {
+        switch outputColorSpace {
+        case .rec709, .linearSRGB, .acescg:
+            return [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ]
+        case .displayP3:
+            return [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_P3_D65,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ]
+        case .bt2020:
+            return [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+            ]
+        }
     }
     
-    nonisolated private static func applyCanvasCrop(_ normalizedCropRect: CGRect?, to image: CIImage, renderSize: CGSize) -> CIImage {
+    nonisolated private static func applyCanvasCrop(
+        _ normalizedCropRect: CGRect?,
+        to image: CIImage,
+        renderSize: CGSize,
+        preferredTransform: CGAffineTransform?
+    ) -> CIImage {
         guard renderSize.width > 1, renderSize.height > 1 else { return image }
 
         let sourceExtent = image.extent.standardized
         guard sourceExtent.width > 1, sourceExtent.height > 1 else { return image }
 
-        let sourceAspect = sourceExtent.width / sourceExtent.height
-        let canvasAspect = renderSize.width / renderSize.height
-        let fittedCrop = CanvasCropMath.fittedNormalizedCropRect(
+        let cropRect = resolvedCropRect(
             normalizedCropRect,
-            sourceAspect: sourceAspect,
-            canvasAspect: canvasAspect
+            sourceExtent: sourceExtent,
+            renderSize: renderSize,
+            preferredTransform: preferredTransform
         )
-
-        let clamped = CGRect(
-            x: min(max(fittedCrop.origin.x, 0), 1),
-            y: min(max(fittedCrop.origin.y, 0), 1),
-            width: min(max(fittedCrop.size.width, 0.05), 1),
-            height: min(max(fittedCrop.size.height, 0.05), 1)
-        )
-        let maxX = min(clamped.maxX, 1)
-        let maxY = min(clamped.maxY, 1)
-        let cropRect = CGRect(
-            x: sourceExtent.minX + (clamped.minX * sourceExtent.width),
-            y: sourceExtent.minY + (clamped.minY * sourceExtent.height),
-            width: max((maxX - clamped.minX) * sourceExtent.width, 1),
-            height: max((maxY - clamped.minY) * sourceExtent.height, 1)
-        ).integral
 
         guard cropRect.width > 1, cropRect.height > 1 else { return image }
 
@@ -602,5 +735,106 @@ final class TimelineExporter {
         return translated
             .composited(over: background)
             .cropped(to: targetRect)
+    }
+
+    nonisolated private static func resolvedCropRect(
+        _ normalizedCropRect: CGRect?,
+        sourceExtent: CGRect,
+        renderSize: CGSize,
+        preferredTransform: CGAffineTransform?
+    ) -> CGRect {
+        let canvasAspect = renderSize.width / renderSize.height
+        let imageAspect = sourceExtent.width / sourceExtent.height
+
+        guard let preferredTransform else {
+            return directCropRect(
+                normalizedCropRect,
+                sourceExtent: sourceExtent,
+                sourceAspect: imageAspect,
+                canvasAspect: canvasAspect
+            )
+        }
+
+        let displaySize = displaySize(for: sourceExtent.size, preferredTransform: preferredTransform)
+        let displayAspect = max(displaySize.width / max(displaySize.height, 0.001), 0.001)
+
+        if abs(displayAspect - imageAspect) < 0.01 {
+            return directCropRect(
+                normalizedCropRect,
+                sourceExtent: sourceExtent,
+                sourceAspect: displayAspect,
+                canvasAspect: canvasAspect
+            )
+        }
+
+        let fittedCrop = CanvasCropMath.fittedNormalizedCropRect(
+            normalizedCropRect,
+            sourceAspect: displayAspect,
+            canvasAspect: canvasAspect
+        )
+        let displayCropRect = rect(
+            from: fittedCrop,
+            in: CGRect(origin: .zero, size: displaySize)
+        )
+
+        let zeroOriginSource = CGRect(origin: .zero, size: sourceExtent.size)
+        let transformedBounds = zeroOriginSource
+            .applying(preferredTransform)
+            .standardized
+        let transformToDisplayOrigin = preferredTransform.concatenating(
+            CGAffineTransform(
+                translationX: -transformedBounds.minX,
+                y: -transformedBounds.minY
+            )
+        )
+
+        let imageSpaceCrop = displayCropRect
+            .applying(transformToDisplayOrigin.inverted())
+            .standardized
+            .offsetBy(dx: sourceExtent.minX, dy: sourceExtent.minY)
+
+        return clampedCropRect(imageSpaceCrop, inside: sourceExtent)
+    }
+
+    nonisolated private static func directCropRect(
+        _ normalizedCropRect: CGRect?,
+        sourceExtent: CGRect,
+        sourceAspect: CGFloat,
+        canvasAspect: CGFloat
+    ) -> CGRect {
+        let fittedCrop = CanvasCropMath.fittedNormalizedCropRect(
+            normalizedCropRect,
+            sourceAspect: sourceAspect,
+            canvasAspect: canvasAspect
+        )
+        return clampedCropRect(
+            rect(from: fittedCrop, in: sourceExtent),
+            inside: sourceExtent
+        )
+    }
+
+    nonisolated private static func rect(from normalizedRect: CGRect, in extent: CGRect) -> CGRect {
+        let clamped = CGRect(
+            x: min(max(normalizedRect.origin.x, 0), 1),
+            y: min(max(normalizedRect.origin.y, 0), 1),
+            width: min(max(normalizedRect.size.width, 0.05), 1),
+            height: min(max(normalizedRect.size.height, 0.05), 1)
+        )
+        let maxX = min(clamped.maxX, 1)
+        let maxY = min(clamped.maxY, 1)
+        return CGRect(
+            x: extent.minX + (clamped.minX * extent.width),
+            y: extent.minY + (clamped.minY * extent.height),
+            width: max((maxX - clamped.minX) * extent.width, 1),
+            height: max((maxY - clamped.minY) * extent.height, 1)
+        ).integral
+    }
+
+    nonisolated private static func clampedCropRect(_ rect: CGRect, inside extent: CGRect) -> CGRect {
+        let intersected = rect.intersection(extent).integral
+        if intersected.width > 1, intersected.height > 1 {
+            return intersected
+        }
+        return extent.integral
     }
 }

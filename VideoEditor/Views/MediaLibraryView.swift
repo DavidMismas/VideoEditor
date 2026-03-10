@@ -20,7 +20,11 @@ struct MediaLibraryView: View {
             ScrollView {
                 LazyVStack(spacing: 4) {
                     ForEach(viewModel.mediaLibrary) { item in
-                        MediaItemRow(item: item, isSelected: viewModel.selectedMediaLibraryItemId == item.id)
+                        MediaItemRow(
+                            item: item,
+                            isSelected: viewModel.selectedMediaLibraryItemId == item.id,
+                            onDelete: { viewModel.deleteMediaItem(item.id) }
+                        )
                             .onTapGesture(count: 2) {
                                 isolateMediaItem(item)
                             }
@@ -139,6 +143,12 @@ struct MediaLibraryView: View {
 struct MediaItemRow: View {
     let item: MediaItem
     var isSelected: Bool
+    let onDelete: () -> Void
+
+    private var isMissing: Bool {
+        guard let url = item.url else { return true }
+        return !FileManager.default.fileExists(atPath: url.path)
+    }
     
     var body: some View {
         HStack {
@@ -148,6 +158,18 @@ struct MediaItemRow: View {
                 .foregroundColor(isSelected ? .white : Theme.textSecondary)
                 .lineLimit(1)
             Spacer()
+            if isMissing {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(isSelected ? .white : Color.orange)
+                    .help("Original file is missing from its saved path.")
+            }
+            Button(action: onDelete) {
+                Image(systemName: "trash")
+                    .foregroundColor(isSelected ? .white : Theme.textSecondary)
+                    .padding(.leading, 6)
+            }
+            .buttonStyle(.plain)
+            .help("Remove from project")
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 12)

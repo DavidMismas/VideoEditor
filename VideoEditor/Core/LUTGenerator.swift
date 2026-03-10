@@ -1,6 +1,5 @@
 import Foundation
 import CoreImage
-import CoreGraphics
 
 nonisolated class LUTGenerator {
     static let shared = LUTGenerator()
@@ -23,22 +22,17 @@ nonisolated class LUTGenerator {
                 return cachedFilter
             }
 
-            if adjustments == ColorAdjustments() {
+            if !adjustments.hasGeneratedLUTAdjustments {
                 cachedKey = key
                 cachedFilter = nil
                 return nil
             }
 
             let cubeData = generateCubeData(for: adjustments, dimension: dimension)
-            let cubeFilter = CIFilter(name: "CIColorCubeWithColorSpace") ?? CIFilter(name: "CIColorCube")
+            let cubeFilter = CIFilter(name: "CIColorCube")
             cubeFilter?.setValue(dimension, forKey: "inputCubeDimension")
             cubeFilter?.setValue(cubeData, forKey: "inputCubeData")
-            cubeFilter?.setValue(false, forKey: "inputExtrapolate")
-
-            if let outputColorSpace = cgColorSpace(for: adjustments.outputColorSpace),
-               cubeFilter?.inputKeys.contains("inputColorSpace") == true {
-                cubeFilter?.setValue(outputColorSpace, forKey: "inputColorSpace")
-            }
+            cubeFilter?.setValue(true, forKey: "inputExtrapolate")
 
             cachedKey = key
             cachedFilter = cubeFilter
@@ -56,9 +50,8 @@ nonisolated class LUTGenerator {
         let cubeSize = dimension * dimension * dimension * 4
         var cube = [Float](repeating: 0, count: cubeSize)
 
-        let inputPrimaries = primaries(for: adjustments.inputColorSpace)
-        let workingPrimaries = primaries(for: adjustments.workingColorSpace)
-        let outputPrimaries = primaries(for: adjustments.outputColorSpace)
+        let workingSpace: SignalSpace = .linearSRGB
+        let lumaCoefficients = lumaCoefficients(for: workingSpace)
 
         for b in 0..<dimension {
             let blue = Double(b) / Double(dimension - 1)
@@ -69,24 +62,17 @@ nonisolated class LUTGenerator {
 
                     var working = RGB(red: red, green: green, blue: blue)
 
-                    working = decodeTransfer(working, profile: adjustments.inputColorSpace)
-                    working = convertPrimaries(working, from: inputPrimaries, to: workingPrimaries)
-
-                    working = applyExposureAndContrast(working, adjustments: adjustments)
-                    working = applyPrimaryChromaControls(working, adjustments: adjustments)
-                    working = applyHSLSecondaries(working, adjustments: adjustments)
-                    working = applyLiftGammaGainOffset(working, adjustments: adjustments)
-                    working = applyToneCurves(working, adjustments: adjustments)
-                    working = applyFilmicRolloff(working, adjustments: adjustments)
-
-                    var output = convertPrimaries(working, from: workingPrimaries, to: outputPrimaries)
-                    output = encodeTransfer(output, profile: adjustments.outputColorSpace)
-                    output = clampRGB(output, min: 0.0, max: 1.0)
+                    working = applyPrimaryToneControls(working, adjustments: adjustments, lumaCoefficients: lumaCoefficients)
+                    working = applyPrimaryChromaControls(working, adjustments: adjustments, lumaCoefficients: lumaCoefficients)
+                    working = applyHSLSecondaries(working, adjustments: adjustments, lumaCoefficients: lumaCoefficients)
+                    working = applyLiftGammaGainOffset(working, adjustments: adjustments, lumaCoefficients: lumaCoefficients)
+                    working = applyToneCurves(working, adjustments: adjustments, lumaCoefficients: lumaCoefficients)
+                    working = applyFilmicRolloff(working, adjustments: adjustments, lumaCoefficients: lumaCoefficients)
 
                     let dataOffset = ((b * dimension * dimension) + (g * dimension) + r) * 4
-                    cube[dataOffset + 0] = Float(output.red)
-                    cube[dataOffset + 1] = Float(output.green)
-                    cube[dataOffset + 2] = Float(output.blue)
+                    cube[dataOffset + 0] = Float(working.red)
+                    cube[dataOffset + 1] = Float(working.green)
+                    cube[dataOffset + 2] = Float(working.blue)
                     cube[dataOffset + 3] = 1.0
                 }
             }
@@ -95,26 +81,60 @@ nonisolated class LUTGenerator {
         return cube.withUnsafeBufferPointer { Data(buffer: $0) }
     }
 
-    private func applyExposureAndContrast(_ rgb: RGB, adjustments: ColorAdjustments) -> RGB {
-        var output = rgb
-
-        if abs(adjustments.exposure) > 1e-6 {
-            let exposureScale = pow(2.0, adjustments.exposure)
-            output = output * exposureScale
-        }
+    private func applyPrimaryToneControls(
+        _ rgb: RGB,
+        adjustments: ColorAdjustments,
+        lumaCoefficients: RGB
+    ) -> RGB {
+        let exposureScale = pow(2.0, adjustments.exposure)
+        let exposed = rgb * exposureScale
+        let sourceY = max(luma(exposed, coefficients: lumaCoefficients), 0.0)
+        let pivot = encodedPerceptualLuma(0.18)
+        let contrastSlope = pow(max(0.01, adjustments.contrast), 1.2)
+        var tone = encodedPerceptualLuma(sourceY)
 
         if abs(adjustments.contrast - 1.0) > 1e-6 {
-            let pivot = 0.18
-            let y = luma709(output)
-            let contrastedY = pivot + ((y - pivot) * adjustments.contrast)
-            output = setLumaPreserveChroma(output, targetLuma: contrastedY)
+            tone = pivot + ((tone - pivot) * contrastSlope)
         }
 
-        return output
+        let shadowAmount = clamp(adjustments.shadows / 2.0, min: -1.0, max: 1.0)
+        let highlightAmount = clamp(adjustments.highlights / 2.0, min: -1.0, max: 1.0)
+        let shadowMask = 1.0 - smoothstep(edge0: 0.16, edge1: 0.60, x: tone)
+        let highlightMask = smoothstep(edge0: 0.40, edge1: 0.92, x: tone)
+
+        if abs(shadowAmount) > 1e-6 {
+            let strength = shadowAmount >= 0 ? 0.18 : 0.16
+            tone += shadowAmount * strength * pow(shadowMask, 1.2)
+        }
+
+        if abs(highlightAmount) > 1e-6 {
+            let strength = highlightAmount >= 0 ? 0.15 : 0.20
+            tone += highlightAmount * strength * pow(highlightMask, 1.05)
+        }
+
+        var targetY = decodedPerceptualLuma(tone)
+        if highlightAmount > 1e-6 {
+            let extended = targetY * (1.0 + (0.35 * highlightAmount))
+            let protected = compressHighlights(extended, start: 0.82, strength: 0.45 * highlightAmount)
+            targetY = mix(targetY, protected, highlightMask)
+        } else if highlightAmount < -1e-6 {
+            let recovered = compressHighlights(targetY, start: 0.34, strength: abs(highlightAmount) * 2.8)
+            targetY = mix(targetY, recovered, highlightMask)
+        }
+
+        return remapLuminancePreservingRatios(
+            exposed,
+            sourceLuma: sourceY,
+            targetLuma: targetY
+        )
     }
 
-    private func applyPrimaryChromaControls(_ rgb: RGB, adjustments: ColorAdjustments) -> RGB {
-        var y = luma709(rgb)
+    private func applyPrimaryChromaControls(
+        _ rgb: RGB,
+        adjustments: ColorAdjustments,
+        lumaCoefficients: RGB
+    ) -> RGB {
+        var y = luma(rgb, coefficients: lumaCoefficients)
         var cr = rgb.red - y
         var cb = rgb.blue - y
 
@@ -133,14 +153,21 @@ nonisolated class LUTGenerator {
 
         let red = y + cr
         let blue = y + cb
-        let green = (y - (0.2126 * red) - (0.0722 * blue)) / 0.7152
-        y = luma709(RGB(red: red, green: green, blue: blue))
+        let green = reconstructedGreen(luma: y, red: red, blue: blue, coefficients: lumaCoefficients)
+        y = luma(RGB(red: red, green: green, blue: blue), coefficients: lumaCoefficients)
 
-        // Keep chroma operations centered around perceived luma.
-        return setLumaPreserveChroma(RGB(red: red, green: green, blue: blue), targetLuma: y)
+        return setLumaPreserveChroma(
+            RGB(red: red, green: green, blue: blue),
+            targetLuma: y,
+            coefficients: lumaCoefficients
+        )
     }
 
-    private func applyHSLSecondaries(_ rgb: RGB, adjustments: ColorAdjustments) -> RGB {
+    private func applyHSLSecondaries(
+        _ rgb: RGB,
+        adjustments: ColorAdjustments,
+        lumaCoefficients: RGB
+    ) -> RGB {
         var output = rgb
         let analysis = clampRGB(output, min: 0.0, max: 1.0)
         let hsl = rgbToHSL(analysis)
@@ -207,30 +234,33 @@ nonisolated class LUTGenerator {
             let normalizedHueShift = hueWeightedSum / hueWeightTotal
             let influence = pow(clamp(hueWeightTotal, min: 0.0, max: 1.0), 0.75)
             let radians = normalizedHueShift * ColorControlMath.hslHueControlTurns * ColorControlMath.twoPi * saturationGate * influence
-            output = rotateHuePreservingLuma(output, radians: radians)
+            output = rotateHuePreservingLuma(output, radians: radians, coefficients: lumaCoefficients)
         }
 
         if satWeightTotal > 1e-6 {
             let normalizedSatDelta = satWeightedSum / satWeightTotal
             let influence = pow(clamp(satWeightTotal, min: 0.0, max: 1.0), 0.80)
             let scale = 1.0 + (normalizedSatDelta * 1.10 * saturationGate * influence)
-            output = scaleSaturationPreservingLuma(output, scale: max(0.0, scale))
+            output = scaleSaturationPreservingLuma(output, scale: max(0.0, scale), coefficients: lumaCoefficients)
         }
 
         if lumWeightTotal > 1e-6 {
-            // Perceptual luminance control uses Rec.709 Y, not HSL lightness.
             let normalizedLumDelta = clamp(lumWeightedSum / lumWeightTotal, min: -1.0, max: 1.0)
             let influence = pow(clamp(lumWeightTotal, min: 0.0, max: 1.0), 0.90)
             let deltaY = normalizedLumDelta * 0.25 * saturationGate * influence
-            let currentY = luma709(output)
-            output = setLumaPreserveChroma(output, targetLuma: currentY + deltaY)
+            let currentY = luma(output, coefficients: lumaCoefficients)
+            output = setLumaPreserveChroma(output, targetLuma: currentY + deltaY, coefficients: lumaCoefficients)
         }
 
         return output
     }
 
-    private func applyLiftGammaGainOffset(_ rgb: RGB, adjustments: ColorAdjustments) -> RGB {
-        let baseY = luma709(rgb)
+    private func applyLiftGammaGainOffset(
+        _ rgb: RGB,
+        adjustments: ColorAdjustments,
+        lumaCoefficients: RGB
+    ) -> RGB {
+        let baseY = luma(rgb, coefficients: lumaCoefficients)
 
         let shadowMask = 1.0 - smoothstep(edge0: 0.02, edge1: 0.45, x: baseY)
         let highlightMask = smoothstep(edge0: 0.45, edge1: 0.98, x: baseY)
@@ -251,7 +281,7 @@ nonisolated class LUTGenerator {
         y += adjustments.gainWheel.luma * 0.22 * highlightMask
         y += adjustments.offsetWheel.luma * 0.20
 
-        var output = setLumaPreserveChroma(rgb, targetLuma: y)
+        var output = setLumaPreserveChroma(rgb, targetLuma: y, coefficients: lumaCoefficients)
         output = applyWheelTint(output, wheel: adjustments.liftWheel, mask: shadowMask, strength: 0.28)
         output = applyWheelTint(output, wheel: adjustments.gammaWheel, mask: midMask, strength: 0.24)
         output = applyWheelTint(output, wheel: adjustments.gainWheel, mask: highlightMask, strength: 0.30)
@@ -259,13 +289,17 @@ nonisolated class LUTGenerator {
         return output
     }
 
-    private func applyToneCurves(_ rgb: RGB, adjustments: ColorAdjustments) -> RGB {
+    private func applyToneCurves(
+        _ rgb: RGB,
+        adjustments: ColorAdjustments,
+        lumaCoefficients: RGB
+    ) -> RGB {
         var output = rgb
 
         if adjustments.lumaCurveEnabled {
-            let currentY = clamp(luma709(output), min: 0.0, max: 1.0)
+            let currentY = clamp(luma(output, coefficients: lumaCoefficients), min: 0.0, max: 1.0)
             let curvedY = sampleCurve(adjustments.lumaCurve.values, at: currentY)
-            output = setLumaPreserveChroma(output, targetLuma: curvedY)
+            output = setLumaPreserveChroma(output, targetLuma: curvedY, coefficients: lumaCoefficients)
         }
 
         if adjustments.rgbCurvesEnabled {
@@ -277,40 +311,23 @@ nonisolated class LUTGenerator {
         return output
     }
 
-    private func applyFilmicRolloff(_ rgb: RGB, adjustments: ColorAdjustments) -> RGB {
-        let inputY = max(luma709(rgb), 0.0)
-        var y = inputY
-
-        // Basic Highlights/Shadows sliders should be range-isolated and predictable.
-        let shadowAmount = clamp(adjustments.shadows / 2.0, min: -1.0, max: 1.0)
-        let highlightAmount = clamp(adjustments.highlights / 2.0, min: -1.0, max: 1.0)
-        let shadowMask = 1.0 - smoothstep(edge0: 0.04, edge1: 0.52, x: inputY)
-        let highlightMask = smoothstep(edge0: 0.42, edge1: 0.98, x: inputY)
-
-        if abs(shadowAmount) > 1e-6 {
-            let lifted = pow(inputY, 1.0 / (1.0 + (1.35 * max(shadowAmount, 0.0))))
-            let deepened = pow(inputY, 1.0 + (1.55 * max(-shadowAmount, 0.0)))
-            let shadowTarget = shadowAmount >= 0 ? lifted : deepened
-            y += (shadowTarget - inputY) * shadowMask
-        }
-
-        if abs(highlightAmount) > 1e-6 {
-            if highlightAmount >= 0 {
-                let boosted = y * (1.0 + (0.65 * highlightAmount))
-                let protected = compressHighlights(boosted, start: 0.78, strength: 0.65 * highlightAmount)
-                y += (protected - y) * highlightMask
-            } else {
-                let recovered = compressHighlights(y, start: 0.52, strength: abs(highlightAmount) * 2.2)
-                y += (recovered - y) * highlightMask
-            }
-        }
-
+    private func applyFilmicRolloff(
+        _ rgb: RGB,
+        adjustments: ColorAdjustments,
+        lumaCoefficients: RGB
+    ) -> RGB {
         let filmicStrength = clamp(adjustments.filmicHighlightRolloff, min: 0.0, max: 2.5)
-        if filmicStrength > 1e-6 {
-            y = compressHighlights(y, start: 0.64, strength: filmicStrength)
+        guard filmicStrength > 1e-6 else {
+            return rgb
         }
 
-        return setLumaPreserveChroma(rgb, targetLuma: y)
+        let inputY = max(luma(rgb, coefficients: lumaCoefficients), 0.0)
+        let rolled = compressHighlights(inputY, start: 0.64, strength: filmicStrength)
+        return remapLuminancePreservingRatios(
+            rgb,
+            sourceLuma: inputY,
+            targetLuma: rolled
+        )
     }
 
     private func applyWheelTint(_ rgb: RGB, wheel: ColorWheelControl, mask: Double, strength: Double) -> RGB {
@@ -329,11 +346,11 @@ nonisolated class LUTGenerator {
         )
     }
 
-    private func scaleSaturationPreservingLuma(_ rgb: RGB, scale: Double) -> RGB {
-        let y = luma709(rgb)
+    private func scaleSaturationPreservingLuma(_ rgb: RGB, scale: Double, coefficients: RGB) -> RGB {
+        let y = luma(rgb, coefficients: coefficients)
         let red = y + ((rgb.red - y) * scale)
         let blue = y + ((rgb.blue - y) * scale)
-        let green = (y - (0.2126 * red) - (0.0722 * blue)) / 0.7152
+        let green = reconstructedGreen(luma: y, red: red, blue: blue, coefficients: coefficients)
         return RGB(
             red: red,
             green: green.isFinite ? green : y,
@@ -341,9 +358,9 @@ nonisolated class LUTGenerator {
         )
     }
 
-    private func rotateHuePreservingLuma(_ rgb: RGB, radians: Double) -> RGB {
+    private func rotateHuePreservingLuma(_ rgb: RGB, radians: Double, coefficients: RGB) -> RGB {
         guard abs(radians) > 1e-9 else { return rgb }
-        let y = luma709(rgb)
+        let y = luma(rgb, coefficients: coefficients)
         let cr = rgb.red - y
         let cb = rgb.blue - y
 
@@ -355,25 +372,61 @@ nonisolated class LUTGenerator {
 
         let red = y + rotatedCr
         let blue = y + rotatedCb
-        let green = (y - (0.2126 * red) - (0.0722 * blue)) / 0.7152
+        let green = reconstructedGreen(luma: y, red: red, blue: blue, coefficients: coefficients)
         return RGB(red: red, green: green, blue: blue)
     }
 
-    private func setLumaPreserveChroma(_ rgb: RGB, targetLuma: Double) -> RGB {
-        let y = luma709(rgb)
+    private func setLumaPreserveChroma(_ rgb: RGB, targetLuma: Double, coefficients: RGB) -> RGB {
+        let y = luma(rgb, coefficients: coefficients)
         let cr = rgb.red - y
         let cb = rgb.blue - y
 
         let newY = max(targetLuma, 0.0)
         let red = newY + cr
         let blue = newY + cb
-        let green = (newY - (0.2126 * red) - (0.0722 * blue)) / 0.7152
+        let green = reconstructedGreen(luma: newY, red: red, blue: blue, coefficients: coefficients)
 
         return RGB(
             red: red.isFinite ? red : newY,
             green: green.isFinite ? green : newY,
             blue: blue.isFinite ? blue : newY
         )
+    }
+
+    private func remapLuminancePreservingRatios(
+        _ rgb: RGB,
+        sourceLuma: Double,
+        targetLuma: Double
+    ) -> RGB {
+        let safeTarget = max(targetLuma, 0.0)
+        let safeSource = max(sourceLuma, 1e-6)
+        let scaled = rgb * (safeTarget / safeSource)
+
+        if sourceLuma <= 1e-4 {
+            let neutral = RGB(red: safeTarget, green: safeTarget, blue: safeTarget)
+            let blend = smoothstep(edge0: 0.0, edge1: 1e-4, x: sourceLuma)
+            return RGB(
+                red: mix(neutral.red, scaled.red, blend),
+                green: mix(neutral.green, scaled.green, blend),
+                blue: mix(neutral.blue, scaled.blue, blend)
+            )
+        }
+
+        return scaled
+    }
+
+    private func reconstructedGreen(luma: Double, red: Double, blue: Double, coefficients: RGB) -> Double {
+        let greenCoefficient = max(coefficients.green, 1e-6)
+        return (luma - (coefficients.red * red) - (coefficients.blue * blue)) / greenCoefficient
+    }
+
+    private func encodedPerceptualLuma(_ y: Double) -> Double {
+        let scaled = max(y, 0.0) * 15.0
+        return log2(1.0 + scaled) / 4.0
+    }
+
+    private func decodedPerceptualLuma(_ tone: Double) -> Double {
+        (pow(16.0, tone) - 1.0) / 15.0
     }
 
     private func compressHighlights(_ y: Double, start: Double, strength: Double) -> Double {
@@ -417,8 +470,8 @@ nonisolated class LUTGenerator {
         return points.map { clamp($0, min: 0.0, max: 1.0) }
     }
 
-    private func luma709(_ rgb: RGB) -> Double {
-        (0.2126 * rgb.red) + (0.7152 * rgb.green) + (0.0722 * rgb.blue)
+    private func luma(_ rgb: RGB, coefficients: RGB) -> Double {
+        (coefficients.red * rgb.red) + (coefficients.green * rgb.green) + (coefficients.blue * rgb.blue)
     }
 
     private func rgbToHSL(_ rgb: RGB) -> (h: Double, s: Double, l: Double) {
@@ -431,7 +484,8 @@ nonisolated class LUTGenerator {
             return (0.0, 0.0, lightness)
         }
 
-        let saturation = delta / (1.0 - abs((2.0 * lightness) - 1.0))
+        let saturationDenominator = max(1.0 - abs((2.0 * lightness) - 1.0), 1e-6)
+        let saturation = delta / saturationDenominator
         var hue: Double
 
         if maxValue == rgb.red {
@@ -493,177 +547,17 @@ nonisolated class LUTGenerator {
         )
     }
 
-    private func decodeTransfer(_ rgb: RGB, profile: ColorSpaceProfile) -> RGB {
-        RGB(
-            red: decodeTransfer(rgb.red, profile: profile),
-            green: decodeTransfer(rgb.green, profile: profile),
-            blue: decodeTransfer(rgb.blue, profile: profile)
-        )
-    }
-
-    private func encodeTransfer(_ rgb: RGB, profile: ColorSpaceProfile) -> RGB {
-        RGB(
-            red: encodeTransfer(rgb.red, profile: profile),
-            green: encodeTransfer(rgb.green, profile: profile),
-            blue: encodeTransfer(rgb.blue, profile: profile)
-        )
-    }
-
-    private func decodeTransfer(_ value: Double, profile: ColorSpaceProfile) -> Double {
-        let v = clamp(value, min: 0.0, max: 1.0)
-        switch profile {
+    private func lumaCoefficients(for space: SignalSpace) -> RGB {
+        switch space {
         case .displayP3:
-            if v <= 0.04045 { return v / 12.92 }
-            return pow((v + 0.055) / 1.055, 2.4)
-        case .rec709, .bt2020:
-            if v < 0.081 { return v / 4.5 }
-            return pow((v + 0.099) / 1.099, 1.0 / 0.45)
-        }
-    }
-
-    private func encodeTransfer(_ value: Double, profile: ColorSpaceProfile) -> Double {
-        let v = max(value, 0.0)
-        switch profile {
-        case .displayP3:
-            if v <= 0.0031308 { return v * 12.92 }
-            return (1.055 * pow(v, 1.0 / 2.4)) - 0.055
-        case .rec709, .bt2020:
-            if v < 0.018 { return v * 4.5 }
-            return (1.099 * pow(v, 0.45)) - 0.099
-        }
-    }
-
-    private enum RGBPrimaries {
-        case rec709
-        case displayP3
-        case bt2020
-        case acescg
-    }
-
-    private func primaries(for profile: ColorSpaceProfile) -> RGBPrimaries {
-        switch profile {
-        case .rec709: return .rec709
-        case .displayP3: return .displayP3
-        case .bt2020: return .bt2020
-        }
-    }
-
-    private func primaries(for profile: WorkingColorSpaceProfile) -> RGBPrimaries {
-        switch profile {
-        case .linearSRGB: return .rec709
-        case .acescg: return .acescg
-        }
-    }
-
-    private func convertPrimaries(_ rgb: RGB, from source: RGBPrimaries, to destination: RGBPrimaries) -> RGB {
-        if source == destination { return rgb }
-        let xyz = multiply(matrixToXYZ(for: source), rgb)
-        return multiply(matrixFromXYZ(for: destination), xyz)
-    }
-
-    private func matrixToXYZ(for primaries: RGBPrimaries) -> Matrix3x3 {
-        switch primaries {
-        case .rec709:
-            return Matrix3x3(
-                0.4124564, 0.3575761, 0.1804375,
-                0.2126729, 0.7151522, 0.0721750,
-                0.0193339, 0.1191920, 0.9503041
-            )
-        case .displayP3:
-            return Matrix3x3(
-                0.48657095, 0.26566769, 0.19821729,
-                0.22897456, 0.69173852, 0.07928691,
-                0.00000000, 0.04511338, 1.04394437
-            )
+            return RGB(red: 0.22897456, green: 0.69173852, blue: 0.07928691)
         case .bt2020:
-            return Matrix3x3(
-                0.63695805, 0.14461690, 0.16888098,
-                0.26270021, 0.67799807, 0.05930172,
-                0.00000000, 0.02807269, 1.06098506
-            )
+            return RGB(red: 0.26270021, green: 0.67799807, blue: 0.05930172)
         case .acescg:
-            return Matrix3x3(
-                0.66245418, 0.13400421, 0.15618769,
-                0.27222872, 0.67408177, 0.05368952,
-                -0.00557465, 0.00406073, 1.01033910
-            )
+            return RGB(red: 0.27222872, green: 0.67408177, blue: 0.05368952)
+        default:
+            return RGB(red: 0.2126729, green: 0.7151522, blue: 0.0721750)
         }
-    }
-
-    private func matrixFromXYZ(for primaries: RGBPrimaries) -> Matrix3x3 {
-        switch primaries {
-        case .rec709:
-            return Matrix3x3(
-                3.2404542, -1.5371385, -0.4985314,
-                -0.9692660, 1.8760108, 0.0415560,
-                0.0556434, -0.2040259, 1.0572252
-            )
-        case .displayP3:
-            return Matrix3x3(
-                2.49349691, -0.93138362, -0.40271078,
-                -0.82948897, 1.76266406, 0.02362469,
-                0.03584583, -0.07617239, 0.95688452
-            )
-        case .bt2020:
-            return Matrix3x3(
-                1.71665119, -0.35567078, -0.25336628,
-                -0.66668435, 1.61648124, 0.01576855,
-                0.01763986, -0.04277061, 0.94210312
-            )
-        case .acescg:
-            return Matrix3x3(
-                1.64102338, -0.32480329, -0.23642470,
-                -0.66366286, 1.61533159, 0.01675635,
-                0.01172189, -0.00828444, 0.98839486
-            )
-        }
-    }
-
-    private func multiply(_ matrix: Matrix3x3, _ rgb: RGB) -> RGB {
-        RGB(
-            red: (matrix.m00 * rgb.red) + (matrix.m01 * rgb.green) + (matrix.m02 * rgb.blue),
-            green: (matrix.m10 * rgb.red) + (matrix.m11 * rgb.green) + (matrix.m12 * rgb.blue),
-            blue: (matrix.m20 * rgb.red) + (matrix.m21 * rgb.green) + (matrix.m22 * rgb.blue)
-        )
-    }
-
-    private func cgColorSpace(for profile: ColorSpaceProfile) -> CGColorSpace? {
-        switch profile {
-        case .rec709:
-            return CGColorSpace(name: CGColorSpace.itur_709)
-        case .displayP3:
-            return CGColorSpace(name: CGColorSpace.displayP3)
-        case .bt2020:
-            return CGColorSpace(name: CGColorSpace.itur_2020)
-        }
-    }
-}
-
-nonisolated private struct Matrix3x3 {
-    let m00: Double
-    let m01: Double
-    let m02: Double
-    let m10: Double
-    let m11: Double
-    let m12: Double
-    let m20: Double
-    let m21: Double
-    let m22: Double
-
-    init(
-        _ m00: Double, _ m01: Double, _ m02: Double,
-        _ m10: Double, _ m11: Double, _ m12: Double,
-        _ m20: Double, _ m21: Double, _ m22: Double
-    ) {
-        self.m00 = m00
-        self.m01 = m01
-        self.m02 = m02
-        self.m10 = m10
-        self.m11 = m11
-        self.m12 = m12
-        self.m20 = m20
-        self.m21 = m21
-        self.m22 = m22
     }
 }
 
@@ -678,18 +572,8 @@ nonisolated private struct RGB {
         self.blue = blue
     }
 
-    init(gray: Double) {
-        self.red = gray
-        self.green = gray
-        self.blue = gray
-    }
-
     static func + (lhs: RGB, rhs: RGB) -> RGB {
         RGB(red: lhs.red + rhs.red, green: lhs.green + rhs.green, blue: lhs.blue + rhs.blue)
-    }
-
-    static func - (lhs: RGB, rhs: RGB) -> RGB {
-        RGB(red: lhs.red - rhs.red, green: lhs.green - rhs.green, blue: lhs.blue - rhs.blue)
     }
 
     static func * (lhs: RGB, rhs: Double) -> RGB {

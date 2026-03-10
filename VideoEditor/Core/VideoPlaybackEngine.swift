@@ -1,6 +1,9 @@
 import Foundation
 import AVFoundation
 import CoreImage
+import CoreMedia
+import CoreVideo
+import CoreGraphics
 import Observation
 
 nonisolated private final class AdjustmentSnapshotStore: @unchecked Sendable {
@@ -27,32 +30,44 @@ nonisolated private struct ProcessingSnapshot {
 
 @Observable
 class VideoPlaybackEngine {
+    private enum PreviewRenderMode {
+        case clipSource
+        case passthroughPlayerItem
+    }
+
     var player: AVPlayer = AVPlayer()
     var currentTime: Double = 0
     var duration: Double = 0
     var isPlaying: Bool = false
     var presentationSize: CGSize = .zero
     
-    // Custom video compositor reference
-    private var videoComposition: AVVideoComposition?
     private var timeObserverToken: Any?
     private let adjustmentsStore = AdjustmentSnapshotStore()
+    private let previewStateLock = NSLock()
+    private var videoOutput: AVPlayerItemVideoOutput?
+    private var previewRenderMode: PreviewRenderMode = .clipSource
+    private var previewRevision: Int = 0
+    private var lastRenderedRevision: Int = -1
+    private var lastRenderedImage: CGImage?
+    private var lastRenderedItemTime: CMTime = .invalid
+    private var lastPixelBuffer: CVPixelBuffer?
+    private let displayColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
     
     // We store the current adjustments to apply during playback
     var currentAdjustments: ColorAdjustments = ColorAdjustments() {
         didSet {
             updateSnapshotStore()
-            refreshCurrentFrameIfNeeded()
+            invalidatePreviewCache()
         }
     }
     
     var currentLUTURL: URL? {
         didSet {
             updateSnapshotStore()
-            refreshCurrentFrameIfNeeded()
+            invalidatePreviewCache()
         }
     }
-    
+
     init() {
         attachTimeObserver()
     }
@@ -74,11 +89,7 @@ class VideoPlaybackEngine {
                 let durationSeconds = max(mediaDuration.seconds, 0)
                 
                 let item = AVPlayerItem(asset: asset)
-                let composition = try await makeVideoComposition(for: asset)
-                
-                // Set up the custom video compositor
-                self.videoComposition = composition
-                item.videoComposition = composition
+                self.attachVideoOutput(to: item, renderMode: .clipSource)
                 self.player.replaceCurrentItem(with: item)
                 self.duration = durationSeconds
                 self.currentTime = 0
@@ -92,9 +103,9 @@ class VideoPlaybackEngine {
     }
 
     func loadPreviewItem(_ item: AVPlayerItem, duration: Double? = nil) {
-        videoComposition = item.videoComposition
+        attachVideoOutput(to: item, renderMode: .passthroughPlayerItem)
         player.replaceCurrentItem(with: item)
-        self.duration = max(duration ?? item.asset.duration.seconds, 0)
+        self.duration = max(duration ?? item.duration.seconds, 0)
         currentTime = 0
         isPlaying = false
         presentationSize = item.presentationSize
@@ -102,25 +113,7 @@ class VideoPlaybackEngine {
             await player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
         }
     }
-    
-    private func makeVideoComposition(for asset: AVAsset) async throws -> AVVideoComposition {
-        let adjustmentsStore = self.adjustmentsStore
-        
-        // We use AVVideoComposition to intercept frames and apply CoreImage filters
-        return try await AVVideoComposition(applyingFiltersTo: asset, applier: { params in
-            let processingSnapshot = adjustmentsStore.get()
-            // Apply our CoreImage Processor logic
-            let filteredImage = CoreImageProcessor.shared.applyAdjustments(
-                processingSnapshot.adjustments,
-                lutURL: processingSnapshot.lutURL,
-                timeSeconds: params.compositionTime.isNumeric ? params.compositionTime.seconds : nil,
-                renderQuality: .preview,
-                to: params.sourceImage
-            )
-            return AVCIImageFilteringResult(resultImage: filteredImage)
-        })
-    }
-    
+
     func togglePlayPause() {
         if player.isPlaying {
             player.pause()
@@ -134,6 +127,116 @@ class VideoPlaybackEngine {
     func pause() {
         player.pause()
         isPlaying = false
+    }
+
+    func clearCurrentItem() {
+        pause()
+
+        if let currentItem = player.currentItem,
+           let videoOutput {
+            currentItem.remove(videoOutput)
+        }
+
+        previewStateLock.lock()
+        self.videoOutput = nil
+        previewRenderMode = .clipSource
+        lastRenderedImage = nil
+        lastRenderedItemTime = .invalid
+        lastPixelBuffer = nil
+        previewRevision &+= 1
+        lastRenderedRevision = -1
+        previewStateLock.unlock()
+
+        player.replaceCurrentItem(with: nil)
+        currentTime = 0
+        duration = 0
+        presentationSize = .zero
+    }
+
+    func copyPreviewImage(forHostTime hostTime: CFTimeInterval) -> CGImage? {
+        let output: AVPlayerItemVideoOutput?
+        let renderMode: PreviewRenderMode
+        let revision: Int
+        let cachedImage: CGImage?
+        let cachedRevision: Int
+        let cachedItemTime: CMTime
+        let cachedPixelBuffer: CVPixelBuffer?
+
+        previewStateLock.lock()
+        output = videoOutput
+        renderMode = previewRenderMode
+        revision = previewRevision
+        cachedImage = lastRenderedImage
+        cachedRevision = lastRenderedRevision
+        cachedItemTime = lastRenderedItemTime
+        cachedPixelBuffer = lastPixelBuffer
+        previewStateLock.unlock()
+
+        guard let output else { return cachedImage }
+
+        let requestedItemTime = output.itemTime(forHostTime: hostTime)
+        var pixelBuffer: CVPixelBuffer?
+        var renderItemTime = requestedItemTime
+
+        if output.hasNewPixelBuffer(forItemTime: requestedItemTime) {
+            pixelBuffer = output.copyPixelBuffer(forItemTime: requestedItemTime, itemTimeForDisplay: &renderItemTime)
+        } else {
+            pixelBuffer = cachedPixelBuffer
+            renderItemTime = cachedItemTime
+        }
+
+        if !player.isPlaying,
+           revision == cachedRevision,
+           let cachedImage {
+            return cachedImage
+        }
+
+        guard let pixelBuffer else {
+            return cachedImage
+        }
+
+        let sourceImage = CIImage(
+            cvPixelBuffer: pixelBuffer,
+            options: [.colorSpace: NSNull()]
+        )
+
+        let processor = CoreImageProcessor.shared
+        let outputImage: CIImage
+        let renderContext: CIContext
+
+        switch renderMode {
+        case .clipSource:
+            let snapshot = adjustmentsStore.get()
+            outputImage = processor.applyAdjustments(
+                snapshot.adjustments,
+                lutURL: snapshot.lutURL,
+                timeSeconds: renderItemTime.isNumeric ? renderItemTime.seconds : nil,
+                renderQuality: .preview,
+                to: sourceImage
+            )
+            renderContext = processor.renderContext(for: snapshot.adjustments)
+        case .passthroughPlayerItem:
+            outputImage = sourceImage
+            renderContext = processor.renderContext(workingSpace: .linearSRGB, outputSpace: .rec709)
+        }
+
+        guard let renderedImage = renderContext.createCGImage(
+            outputImage,
+            from: outputImage.extent,
+            format: .RGBA8,
+            colorSpace: displayColorSpace
+        ) else {
+            return cachedImage
+        }
+
+        previewStateLock.lock()
+        lastPixelBuffer = pixelBuffer
+        lastRenderedImage = renderedImage
+        lastRenderedItemTime = renderItemTime
+        lastRenderedRevision = revision
+        previewStateLock.unlock()
+
+        return renderedImage
     }
     
     func seek(to seconds: Double, shouldPause: Bool = true) {
@@ -149,28 +252,6 @@ class VideoPlaybackEngine {
         
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
         currentTime = clampedTime
-    }
-    
-    private func refreshCurrentFrameIfNeeded() {
-        // Force a paused-frame re-render. Seeking to the exact same time can be ignored by AVPlayer,
-        // so we seek by a tiny epsilon to trigger compositor refresh without visibly advancing video.
-        guard let currentItem = player.currentItem, !player.isPlaying else { return }
-
-        let baseTime = currentItem.currentTime()
-        let epsilon = CMTime(value: 1, timescale: 60000) // ~0.000016s
-        var nudgedTime = CMTimeAdd(baseTime, epsilon)
-
-        if currentItem.duration.isNumeric, CMTimeCompare(nudgedTime, currentItem.duration) > 0 {
-            nudgedTime = CMTimeSubtract(baseTime, epsilon)
-        }
-        if CMTimeCompare(nudgedTime, .zero) < 0 {
-            nudgedTime = baseTime
-        }
-
-        currentItem.cancelPendingSeeks()
-        player.seek(to: nudgedTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            self?.player.seek(to: baseTime, toleranceBefore: .zero, toleranceAfter: .zero)
-        }
     }
     
     private func attachTimeObserver() {
@@ -197,6 +278,41 @@ class VideoPlaybackEngine {
             )
         )
     }
+
+    private func invalidatePreviewCache() {
+        previewStateLock.lock()
+        previewRevision &+= 1
+        lastRenderedRevision = -1
+        lastRenderedImage = nil
+        previewStateLock.unlock()
+    }
+
+    private func attachVideoOutput(to item: AVPlayerItem, renderMode: PreviewRenderMode) {
+        if let currentItem = player.currentItem,
+           let videoOutput {
+            currentItem.remove(videoOutput)
+        }
+
+        let output = AVPlayerItemVideoOutput(
+            outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_64RGBAHalf),
+                AVVideoAllowWideColorKey: true
+            ]
+        )
+        output.suppressesPlayerRendering = true
+        item.add(output)
+
+        previewStateLock.lock()
+        videoOutput = output
+        previewRenderMode = renderMode
+        previewRevision &+= 1
+        lastRenderedRevision = -1
+        lastRenderedImage = nil
+        lastRenderedItemTime = .invalid
+        lastPixelBuffer = nil
+        previewStateLock.unlock()
+    }
+
 }
 
 extension AVPlayer {

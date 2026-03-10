@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import CoreMedia
 import AVFoundation
+import CoreVideo
 import Observation
 
 enum TimelinePreviewMode {
@@ -9,10 +10,19 @@ enum TimelinePreviewMode {
     case movie
 }
 
+struct WorkspaceAlert: Identifiable, Equatable {
+    let id: UUID = UUID()
+    let title: String
+    let message: String
+}
+
 @Observable
 class EditorViewModel {
     // Project Settings
     var config = ProjectConfig()
+    var projectName: String?
+    var projectFileURL: URL?
+    var pendingAlert: WorkspaceAlert?
     
     // Playback Engine
     var engine = VideoPlaybackEngine()
@@ -44,6 +54,7 @@ class EditorViewModel {
                 if oldValue != nil {
                     engine.currentAdjustments = ColorAdjustments()
                     engine.currentLUTURL = nil
+                    engine.clearCurrentItem()
                     clipEditorSegments = []
                     clipEditorReferenceDurationSeconds = 0
                     clipEditorSplitModeEnabled = false
@@ -57,17 +68,22 @@ class EditorViewModel {
             selectedTimelineClipID = nil
             moviePreviewLoadTask?.cancel()
             moviePreviewLoadTask = nil
+            engine.currentAdjustments = isolated.adjustments
+            engine.currentLUTURL = lutURL(for: isolated.appliedLUTID)
             
             // Only reload media when the isolated clip itself changes.
             // Slider-driven adjustment changes mutate the same clip instance and should not reset playback.
             let clipChanged = oldValue?.id != isolated.id || oldValue?.mediaItem.url != isolated.mediaItem.url
-            if clipChanged, let url = isolated.mediaItem.url {
+            if clipChanged, let url = existingURL(for: isolated.mediaItem.url) {
                 engine.loadMedia(from: url)
                 clipEditorSegments = [makeClipEditorRootSegment(from: isolated)]
                 clipEditorReferenceDurationSeconds = max(
                     sourceDurationSeconds(for: isolated),
                     max(isolated.duration.seconds, minimumEditorSegmentDurationSeconds)
                 )
+            } else if clipChanged {
+                engine.pause()
+                engine.clearCurrentItem()
             } else if clipEditorSegments.isEmpty {
                 clipEditorSegments = [makeClipEditorRootSegment(from: isolated)]
                 clipEditorReferenceDurationSeconds = max(
@@ -97,9 +113,6 @@ class EditorViewModel {
             )
 
             activeClipEditorDragSession = nil
-            
-            engine.currentAdjustments = isolated.adjustments
-            engine.currentLUTURL = lutURL(for: isolated.appliedLUTID)
         }
     }
     
@@ -143,29 +156,179 @@ class EditorViewModel {
     var exportFormat: ExportFormat = .mp4
     var exportQuality: ExportQuality = .medium
     var exportFrameRate: ExportFrameRate = .fps30
-    var exportResolution: ExportResolution = .fullHD
     
     private let fallbackClipDurationSeconds: Double = 5.0
     private let minimumEditorSegmentDurationSeconds: Double = 0.10
     private let clipEditorInteractionDebugLogging = true
     @ObservationIgnored private var moviePreviewLoadTask: Task<Void, Never>?
+    @ObservationIgnored private var mediaAccessBookmarks: [UUID: Data] = [:]
+    @ObservationIgnored private var lutAccessBookmarks: [UUID: Data] = [:]
+    @ObservationIgnored private var activeSecurityScopedURLs: Set<URL> = []
+
+    var hasActiveProject: Bool {
+        projectName != nil
+    }
+
+    var resolvedProjectName: String {
+        projectName ?? "Untitled Project"
+    }
+
+    var projectCanvasDescription: String {
+        "\(config.resolutionPreset.displayName) • \(config.canvasOrientation.displayName)"
+    }
+
+    var projectResolutionDescription: String {
+        let size = config.resolution
+        return "\(Int(size.width))x\(Int(size.height))"
+    }
+
+    var missingMediaItems: [MediaItem] {
+        mediaLibrary.filter { item in
+            guard let url = item.url else { return true }
+            return !Self.canAccessFile(at: url)
+        }
+    }
+
+    var missingLUTItems: [LUTItem] {
+        importedLUTs.filter { !Self.canAccessFile(at: $0.url) }
+    }
+
+    var hasMissingProjectAssets: Bool {
+        !missingMediaItems.isEmpty || !missingLUTItems.isEmpty
+    }
+
+    var missingAssetsSummary: String {
+        var parts: [String] = []
+        if !missingMediaItems.isEmpty {
+            parts.append("\(missingMediaItems.count) media")
+        }
+        if !missingLUTItems.isEmpty {
+            parts.append("\(missingLUTItems.count) LUT")
+        }
+        return parts.joined(separator: " and ")
+    }
+
+    var missingAssetsDetail: String {
+        let missingMediaNames = missingMediaItems.prefix(3).map(\.name)
+        let missingLUTNames = missingLUTItems.prefix(3).map(\.name)
+        let names = missingMediaNames + missingLUTNames
+        return names.joined(separator: ", ")
+    }
     
     // MARK: - Intents
-    
+
+    func createProject(
+        name: String,
+        resolutionPreset: ProjectResolutionPreset,
+        canvasOrientation: CanvasOrientation
+    ) throws {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            throw ProjectPersistenceError.invalidProjectName
+        }
+
+        resetEditorState()
+        projectName = trimmedName
+        projectFileURL = nil
+        config = ProjectConfig(
+            resolutionPreset: resolutionPreset,
+            frameRate: exportFrameRate.rawValue,
+            canvasOrientation: canvasOrientation
+        )
+    }
+
+    func closeProject() {
+        resetEditorState()
+        projectName = nil
+        projectFileURL = nil
+    }
+
+    func openProject(at url: URL) throws {
+        let project = try ProjectFileStore.load(from: url)
+
+        resetEditorState()
+        projectName = project.name
+        projectFileURL = url
+        config = project.config
+        mediaAccessBookmarks = Dictionary(uniqueKeysWithValues: project.mediaAccessBookmarks.map { ($0.id, $0.bookmarkData) })
+        lutAccessBookmarks = Dictionary(uniqueKeysWithValues: project.lutAccessBookmarks.map { ($0.id, $0.bookmarkData) })
+        mediaLibrary = project.mediaLibrary.map { item in
+            var item = item
+            item.url = item.url?.standardizedFileURL
+            return item
+        }
+        importedLUTs = project.importedLUTs.map { item in
+            var item = item
+            item.url = item.url.standardizedFileURL
+            item.descriptor = ImportedLUTManager.shared.descriptor(for: item.url)
+            return item
+        }
+        videoTracks = project.videoTracks.isEmpty ? [TimelineTrack(name: "V1", clips: [])] : project.videoTracks
+        audioTracks = project.audioTracks.isEmpty ? [TimelineTrack(name: "A1", clips: [], isAudioOnly: true)] : project.audioTracks
+        exportFormat = project.exportFormat
+        exportQuality = project.exportQuality
+        exportFrameRate = project.exportFrameRate
+        restoreProjectAssetAccess()
+        refreshImportedLUTDescriptors()
+        reconcileProjectAssetReferences()
+        refreshLibraryMetadata()
+    }
+
+    func saveProject() throws {
+        guard let projectFileURL else {
+            throw ProjectPersistenceError.noProjectLoaded
+        }
+        try saveProject(to: projectFileURL)
+    }
+
+    func saveProject(to url: URL) throws {
+        guard hasActiveProject else {
+            throw ProjectPersistenceError.noProjectLoaded
+        }
+
+        ensureProjectAssetBookmarks()
+
+        let project = SavedProjectState(
+            name: resolvedProjectName,
+            config: config,
+            mediaLibrary: mediaLibrary,
+            importedLUTs: importedLUTs,
+            videoTracks: videoTracks,
+            audioTracks: audioTracks,
+            exportFormat: exportFormat,
+            exportQuality: exportQuality,
+            exportFrameRate: exportFrameRate,
+            mediaAccessBookmarks: mediaAccessBookmarks.map { SavedSecurityScopedBookmark(id: $0.key, bookmarkData: $0.value) }
+                .sorted { $0.id.uuidString < $1.id.uuidString },
+            lutAccessBookmarks: lutAccessBookmarks.map { SavedSecurityScopedBookmark(id: $0.key, bookmarkData: $0.value) }
+                .sorted { $0.id.uuidString < $1.id.uuidString }
+        )
+        try ProjectFileStore.save(project, to: url)
+        projectFileURL = url
+        projectName = project.name
+    }
+
     func importMedia(url: URL, type: MediaItem.MediaType) {
-        let name = url.lastPathComponent
-        let item = MediaItem(name: name, url: url, type: type)
+        let normalizedURL = url.standardizedFileURL
+        let name = normalizedURL.lastPathComponent
+        let item = MediaItem(name: name, url: normalizedURL, type: type)
         mediaLibrary.append(item)
+        if let bookmark = Self.makeSecurityScopedBookmark(for: normalizedURL) {
+            mediaAccessBookmarks[item.id] = bookmark
+        }
         
         let itemID = item.id
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            guard let seconds = await Self.loadMediaDurationSeconds(for: url, type: type) else { return }
+            let metadata = await Self.loadMediaMetadata(for: normalizedURL, type: type)
             
             await MainActor.run {
                 guard let idx = self.mediaLibrary.firstIndex(where: { $0.id == itemID }) else { return }
-                self.mediaLibrary[idx].durationSeconds = seconds
-                self.refreshClipDurations(for: itemID, loadedDurationSeconds: seconds)
+                if let durationSeconds = metadata.durationSeconds {
+                    self.mediaLibrary[idx].durationSeconds = durationSeconds
+                    self.refreshClipDurations(for: itemID, loadedDurationSeconds: durationSeconds)
+                }
+                self.replaceMediaItemReferences(with: self.mediaLibrary[idx])
             }
         }
     }
@@ -184,9 +347,13 @@ class EditorViewModel {
         
         let item = LUTItem(
             name: normalizedURL.deletingPathExtension().lastPathComponent,
-            url: normalizedURL
+            url: normalizedURL,
+            descriptor: ImportedLUTManager.shared.descriptor(for: normalizedURL)
         )
         importedLUTs.append(item)
+        if let bookmark = Self.makeSecurityScopedBookmark(for: normalizedURL) {
+            lutAccessBookmarks[item.id] = bookmark
+        }
         return true
     }
     
@@ -242,6 +409,54 @@ class EditorViewModel {
             return
         }
     }
+
+    func deleteMediaItem(_ itemID: UUID) {
+        mediaLibrary.removeAll { $0.id == itemID }
+        mediaAccessBookmarks[itemID] = nil
+        removeTimelineClips(where: { $0.mediaItem.id == itemID })
+
+        if isolatedClip?.mediaItem.id == itemID {
+            isolatedClip = nil
+        }
+        if selectedMediaLibraryItemId == itemID {
+            selectedMediaLibraryItemId = nil
+        }
+        syncSelectionAfterTimelineMutation()
+    }
+
+    func deleteClipEditorSegment(_ segmentID: UUID) {
+        guard let index = clipEditorSegments.firstIndex(where: { $0.id == segmentID }) else { return }
+
+        clipEditorSegments.remove(at: index)
+        activeClipEditorDragSession = nil
+
+        guard let firstRemaining = clipEditorSegments.first else {
+            isolatedClip = nil
+            return
+        }
+
+        clipEditorReferenceDurationSeconds = max(
+            sourceDurationSeconds(for: firstRemaining),
+            clipEditorTotalDurationSeconds(),
+            minimumEditorSegmentDurationSeconds
+        )
+
+        if var isolated = isolatedClip {
+            isolated.startTime = firstRemaining.startTime
+            isolated.duration = firstRemaining.duration
+            isolated.appliedLUTID = firstRemaining.appliedLUTID
+            isolated.adjustments = firstRemaining.adjustments
+            isolated.transforms = firstRemaining.transforms
+            isolated.volume = firstRemaining.volume
+            isolated.isMuted = firstRemaining.isMuted
+            isolatedClip = isolated
+        }
+    }
+
+    func deleteTimelineClip(_ clipID: UUID) {
+        removeTimelineClips(where: { $0.id == clipID })
+        syncSelectionAfterTimelineMutation()
+    }
     
     func makeTimelineClip(from item: MediaItem) -> TimelineClip {
         TimelineClip(
@@ -256,17 +471,24 @@ class EditorViewModel {
         previewMode = .clip
         selectedTimelineClipID = nil
         selectedClipId = id
-        guard let id = id, let clip = findClip(id: id), let url = clip.mediaItem.url else {
+        guard let id = id,
+              let clip = findClip(id: id),
+              let url = existingURL(for: clip.mediaItem.url)
+        else {
             if id == nil {
                 engine.currentAdjustments = ColorAdjustments()
                 engine.currentLUTURL = nil
+                engine.clearCurrentItem()
+            } else {
+                engine.pause()
+                engine.clearCurrentItem()
             }
             return
         }
         
-        engine.loadMedia(from: url)
         engine.currentAdjustments = clip.adjustments
         engine.currentLUTURL = lutURL(for: clip.appliedLUTID)
+        engine.loadMedia(from: url)
     }
 
     var isMovieTimelinePreviewActive: Bool {
@@ -295,8 +517,7 @@ class EditorViewModel {
     }
 
     var canvasOrientation: CanvasOrientation {
-        get { config.canvasOrientation }
-        set { config.canvasOrientation = newValue }
+        config.canvasOrientation
     }
 
     var canvasAspectRatio: CGFloat {
@@ -307,11 +528,6 @@ class EditorViewModel {
         let size = engine.presentationSize
         guard size.width > 1, size.height > 1 else { return canvasAspectRatio }
         return max(size.width / size.height, 0.001)
-    }
-
-    func toggleCanvasOrientation() {
-        config.canvasOrientation = config.canvasOrientation == .portrait ? .landscape : .portrait
-        refreshMovieTimelinePreviewIfNeeded()
     }
 
     func updateTransforms(for id: UUID?, _ newTransforms: Transforms) {
@@ -336,7 +552,15 @@ class EditorViewModel {
     func setActivePreviewCropRect(_ rect: CGRect?) {
         guard let clipID = activePreviewClipID else { return }
         var transforms = activePreviewTransforms
-        transforms.cropRect = rect
+        if let rect {
+            transforms.cropRect = CanvasCropMath.fittedNormalizedCropRect(
+                rect,
+                sourceAspect: previewSourceAspectRatio,
+                canvasAspect: canvasAspectRatio
+            )
+        } else {
+            transforms.cropRect = nil
+        }
         updateTransforms(for: clipID, transforms)
     }
 
@@ -344,10 +568,6 @@ class EditorViewModel {
         setActivePreviewCropRect(nil)
     }
 
-    func effectiveExportResolution(for resolution: ExportResolution) -> CGSize {
-        config.canvasOrientation.applied(to: resolution.size)
-    }
-    
     func updateAdjustments(for id: UUID?, _ newAdjustments: ColorAdjustments) {
         guard let id = id else { return }
         
@@ -463,10 +683,7 @@ class EditorViewModel {
         moviePreviewLoadTask?.cancel()
 
         guard hasMovieTimelineContent else {
-            engine.pause()
-            engine.player.replaceCurrentItem(with: nil)
-            engine.currentTime = 0
-            engine.duration = 0
+            engine.clearCurrentItem()
             return
         }
 
@@ -496,6 +713,12 @@ class EditorViewModel {
     @discardableResult
     func applyLUT(_ lutID: UUID, toClip clipID: UUID) -> Bool {
         guard let lut = importedLUTs.first(where: { $0.id == lutID }) else {
+            return false
+        }
+
+        if let clip = findClip(id: clipID) ?? isolatedClip, clip.id == clipID,
+           let alert = lutCompatibilityAlert(for: lut, clip: clip) {
+            pendingAlert = alert
             return false
         }
         
@@ -702,12 +925,10 @@ class EditorViewModel {
         format: ExportFormat,
         quality: ExportQuality,
         frameRate: ExportFrameRate,
-        resolution: ExportResolution,
         onProgress: (@MainActor @Sendable (Double) -> Void)? = nil
     ) async throws {
         var exportConfig = config
         exportConfig.frameRate = frameRate.rawValue
-        exportConfig.resolution = effectiveExportResolution(for: resolution)
         
         try await TimelineExporter.shared.export(
             videoTracks: videoTracks,
@@ -842,6 +1063,45 @@ class EditorViewModel {
             isolatedClip = isolated
         }
     }
+
+    private func replaceMediaItemReferences(with mediaItem: MediaItem) {
+        let remap: (TimelineClip) -> TimelineClip = { clip in
+            guard clip.mediaItem.id == mediaItem.id else { return clip }
+            return TimelineClip(
+                id: clip.id,
+                mediaItem: mediaItem,
+                startTime: clip.startTime,
+                duration: clip.duration,
+                timelineStart: clip.timelineStart,
+                appliedLUTID: clip.appliedLUTID,
+                adjustments: clip.adjustments,
+                transforms: clip.transforms,
+                volume: clip.volume,
+                isMuted: clip.isMuted
+            )
+        }
+
+        for trackIndex in videoTracks.indices {
+            videoTracks[trackIndex].clips = videoTracks[trackIndex].clips.map(remap)
+        }
+
+        for trackIndex in audioTracks.indices {
+            audioTracks[trackIndex].clips = audioTracks[trackIndex].clips.map(remap)
+        }
+
+        if let isolatedClip, isolatedClip.mediaItem.id == mediaItem.id {
+            self.isolatedClip = remap(isolatedClip)
+        }
+
+        clipEditorSegments = clipEditorSegments.map(remap)
+
+        if previewMode == .clip,
+           isolatedClip == nil,
+           let selectedClipId,
+           let selectedClip = findClip(id: selectedClipId) {
+            _ = selectedClip
+        }
+    }
     
     private func shouldReplaceClipDuration(_ duration: CMTime) -> Bool {
         guard duration.isNumeric else { return true }
@@ -850,9 +1110,17 @@ class EditorViewModel {
         return abs(seconds - fallbackClipDurationSeconds) < 0.001
     }
     
+    private nonisolated static func loadMediaMetadata(
+        for url: URL,
+        type: MediaItem.MediaType
+    ) async -> (durationSeconds: Double?, signalSpace: SignalSpace?) {
+        let durationSeconds = await loadMediaDurationSeconds(for: url, type: type)
+        return (durationSeconds, nil)
+    }
+
     private nonisolated static func loadMediaDurationSeconds(for url: URL, type: MediaItem.MediaType) async -> Double? {
         guard type != .image else { return nil }
-        
+
         let asset = AVURLAsset(url: url)
         do {
             let duration = try await asset.load(.duration)
@@ -862,6 +1130,263 @@ class EditorViewModel {
             return seconds
         } catch {
             return nil
+        }
+    }
+
+    private func resetEditorState() {
+        stopAccessingProjectAssets()
+        moviePreviewLoadTask?.cancel()
+        moviePreviewLoadTask = nil
+        config = ProjectConfig()
+        mediaLibrary = []
+        importedLUTs = []
+        mediaAccessBookmarks = [:]
+        lutAccessBookmarks = [:]
+        videoTracks = [TimelineTrack(name: "V1", clips: [])]
+        audioTracks = [TimelineTrack(name: "A1", clips: [], isAudioOnly: true)]
+        selectedClipId = nil
+        selectedMediaLibraryItemId = nil
+        selectedTimelineClipID = nil
+        previewMode = .clip
+        clipEditorSegments = []
+        clipEditorReferenceDurationSeconds = 0
+        clipEditorSplitModeEnabled = false
+        clipEditorTrimModeEnabled = false
+        activeClipEditorDragSession = nil
+        isolatedClip = nil
+        pendingAlert = nil
+        exportFormat = .mp4
+        exportQuality = .medium
+        exportFrameRate = .fps30
+        engine.pause()
+        engine.clearCurrentItem()
+    }
+
+    private func refreshLibraryMetadata() {
+        for item in mediaLibrary {
+            guard let url = item.url else { continue }
+            let itemID = item.id
+            let itemType = item.type
+            Task.detached(priority: .utility) { [weak self] in
+                guard let self else { return }
+                let metadata = await Self.loadMediaMetadata(for: url, type: itemType)
+
+                await MainActor.run {
+                    guard let idx = self.mediaLibrary.firstIndex(where: { $0.id == itemID }) else { return }
+                    if let durationSeconds = metadata.durationSeconds {
+                        self.mediaLibrary[idx].durationSeconds = durationSeconds
+                        self.refreshClipDurations(for: itemID, loadedDurationSeconds: durationSeconds)
+                    }
+                    self.replaceMediaItemReferences(with: self.mediaLibrary[idx])
+                }
+            }
+        }
+    }
+
+    private func restoreProjectAssetAccess() {
+        stopAccessingProjectAssets()
+
+        for index in mediaLibrary.indices {
+            let restored = restoredURL(
+                fallbackURL: mediaLibrary[index].url,
+                bookmarkData: mediaAccessBookmarks[mediaLibrary[index].id]
+            )
+            mediaLibrary[index].url = restored.url
+            if let bookmarkData = restored.bookmarkData {
+                mediaAccessBookmarks[mediaLibrary[index].id] = bookmarkData
+            }
+        }
+
+        for index in importedLUTs.indices {
+            let restored = restoredURL(
+                fallbackURL: importedLUTs[index].url,
+                bookmarkData: lutAccessBookmarks[importedLUTs[index].id]
+            )
+            importedLUTs[index].url = restored.url ?? importedLUTs[index].url.standardizedFileURL
+            if let bookmarkData = restored.bookmarkData {
+                lutAccessBookmarks[importedLUTs[index].id] = bookmarkData
+            }
+        }
+    }
+
+    private func refreshImportedLUTDescriptors() {
+        for index in importedLUTs.indices {
+            importedLUTs[index].descriptor = ImportedLUTManager.shared.descriptor(for: importedLUTs[index].url)
+        }
+    }
+
+    private func ensureProjectAssetBookmarks() {
+        for item in mediaLibrary {
+            guard let url = item.url else { continue }
+            if let bookmark = Self.makeSecurityScopedBookmark(for: url) {
+                mediaAccessBookmarks[item.id] = bookmark
+            }
+        }
+
+        for item in importedLUTs {
+            if let bookmark = Self.makeSecurityScopedBookmark(for: item.url) {
+                lutAccessBookmarks[item.id] = bookmark
+            }
+        }
+    }
+
+    private func reconcileProjectAssetReferences() {
+        let mediaByID = Dictionary(uniqueKeysWithValues: mediaLibrary.map { ($0.id, $0) })
+        let lutIDs = Set(importedLUTs.map(\.id))
+
+        videoTracks = videoTracks.map { track in
+            canonicalizedTrack(track, mediaByID: mediaByID, validLUTIDs: lutIDs)
+        }
+        audioTracks = audioTracks.map { track in
+            canonicalizedTrack(track, mediaByID: mediaByID, validLUTIDs: lutIDs)
+        }
+
+        if let isolatedClip {
+            self.isolatedClip = canonicalizedClip(isolatedClip, mediaByID: mediaByID, validLUTIDs: lutIDs)
+        }
+
+        clipEditorSegments = clipEditorSegments.map { clip in
+            canonicalizedClip(clip, mediaByID: mediaByID, validLUTIDs: lutIDs)
+        }
+    }
+
+    private func canonicalizedTrack(
+        _ track: TimelineTrack,
+        mediaByID: [UUID: MediaItem],
+        validLUTIDs: Set<UUID>
+    ) -> TimelineTrack {
+        var track = track
+        track.clips = track.clips.map { clip in
+            canonicalizedClip(clip, mediaByID: mediaByID, validLUTIDs: validLUTIDs)
+        }
+        return track
+    }
+
+    private func canonicalizedClip(
+        _ clip: TimelineClip,
+        mediaByID: [UUID: MediaItem],
+        validLUTIDs: Set<UUID>
+    ) -> TimelineClip {
+        let mediaItem = mediaByID[clip.mediaItem.id] ?? clip.mediaItem
+        let lutID = clip.appliedLUTID.flatMap { validLUTIDs.contains($0) ? $0 : nil }
+        return TimelineClip(
+            id: clip.id,
+            mediaItem: mediaItem,
+            startTime: clip.startTime,
+            duration: clip.duration,
+            timelineStart: clip.timelineStart,
+            appliedLUTID: lutID,
+            adjustments: clip.adjustments,
+            transforms: clip.transforms,
+            volume: clip.volume,
+            isMuted: clip.isMuted
+        )
+    }
+
+    private func restoredURL(
+        fallbackURL: URL?,
+        bookmarkData: Data?
+    ) -> (url: URL?, bookmarkData: Data?) {
+        let normalizedFallbackURL = fallbackURL?.standardizedFileURL
+
+        if let bookmarkData {
+            var isStale = false
+            if let resolvedURL = try? URL(
+                resolvingBookmarkData: bookmarkData,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            ).standardizedFileURL {
+                let startedAccess = resolvedURL.startAccessingSecurityScopedResource()
+                if startedAccess {
+                    activeSecurityScopedURLs.insert(resolvedURL)
+                }
+                if Self.canAccessFile(at: resolvedURL) {
+                    if isStale {
+                        return (resolvedURL, Self.makeSecurityScopedBookmark(for: resolvedURL) ?? bookmarkData)
+                    }
+                    return (resolvedURL, bookmarkData)
+                }
+            }
+        }
+
+        guard let normalizedFallbackURL else { return (nil, bookmarkData) }
+        if let bookmark = Self.makeSecurityScopedBookmark(for: normalizedFallbackURL) {
+            var isStale = false
+            if let resolvedURL = try? URL(
+                resolvingBookmarkData: bookmark,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            ).standardizedFileURL {
+                let startedAccess = resolvedURL.startAccessingSecurityScopedResource()
+                if startedAccess {
+                    activeSecurityScopedURLs.insert(resolvedURL)
+                }
+                if Self.canAccessFile(at: resolvedURL) {
+                    if isStale {
+                        return (resolvedURL, Self.makeSecurityScopedBookmark(for: resolvedURL) ?? bookmark)
+                    }
+                    return (resolvedURL, bookmark)
+                }
+            }
+        }
+
+        return (normalizedFallbackURL, bookmarkData)
+    }
+
+    private func stopAccessingProjectAssets() {
+        for url in activeSecurityScopedURLs {
+            url.stopAccessingSecurityScopedResource()
+        }
+        activeSecurityScopedURLs.removeAll()
+    }
+
+    private nonisolated static func makeSecurityScopedBookmark(for url: URL) -> Data? {
+        try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+    }
+
+    private nonisolated static func canAccessFile(at url: URL) -> Bool {
+        let normalizedURL = url.standardizedFileURL
+        return FileManager.default.isReadableFile(atPath: normalizedURL.path)
+    }
+
+    private func existingURL(for url: URL?) -> URL? {
+        guard let url else { return nil }
+        let normalizedURL = url.standardizedFileURL
+        return Self.canAccessFile(at: normalizedURL) ? normalizedURL : nil
+    }
+
+    private func lutCompatibilityAlert(for lut: LUTItem, clip: TimelineClip) -> WorkspaceAlert? {
+        _ = lut
+        _ = clip
+        return nil
+    }
+
+    private func removeTimelineClips(where shouldRemove: (TimelineClip) -> Bool) {
+        for index in videoTracks.indices {
+            videoTracks[index].clips.removeAll(where: shouldRemove)
+        }
+        for index in audioTracks.indices {
+            audioTracks[index].clips.removeAll(where: shouldRemove)
+        }
+        refreshMovieTimelinePreviewIfNeeded()
+    }
+
+    private func syncSelectionAfterTimelineMutation() {
+        if let selectedClipId, findClip(id: selectedClipId) == nil {
+            self.selectedClipId = nil
+            if isolatedClip == nil && !isMovieTimelinePreviewActive {
+                engine.clearCurrentItem()
+            }
+        }
+
+        if let selectedTimelineClipID, findTimelineClip(id: selectedTimelineClipID) == nil {
+            self.selectedTimelineClipID = nil
+        }
+
+        if isMovieTimelinePreviewActive {
+            refreshMovieTimelinePreview()
         }
     }
 }

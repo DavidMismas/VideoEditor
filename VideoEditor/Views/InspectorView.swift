@@ -51,7 +51,6 @@ struct InspectorView: View {
                     }
                     
                     BasicAdjustmentsSection(adjustments: baseAdjustments)
-                    ColorPipelineSection(adjustments: baseAdjustments)
                     DetailAdjustmentsSection(adjustments: baseAdjustments)
                     BasicColorSection(adjustments: baseAdjustments)
                     TrueHSLSection(adjustments: baseAdjustments)
@@ -99,7 +98,7 @@ struct LUTLibrarySection: View {
                 .buttonStyle(.plain)
                 
                 if viewModel.importedLUTs.isEmpty {
-                    Text("No LUT imported. Add .cube files and drag them onto the middle Clip Editor timeline.")
+                    Text("No LUT imported. Add Rec.709 creative .cube LUTs and drag them onto the middle Clip Editor timeline. Log/conversion LUTs are no longer supported.")
                         .font(.caption2)
                         .foregroundColor(Theme.textSecondary)
                 } else {
@@ -162,7 +161,7 @@ struct LUTLibrarySection: View {
         if rejectedCount > 0 {
             importMessage = "Imported \(importedCount) LUT(s), rejected \(rejectedCount) invalid file(s)."
         } else if importedCount > 0 {
-            importMessage = "Imported \(importedCount) LUT(s). Drag LUT onto the middle Clip Editor timeline."
+            importMessage = "Imported \(importedCount) LUT(s). Use Rec.709 creative look LUTs and drag them onto the middle Clip Editor timeline."
         } else {
             importMessage = "No new LUT imported."
         }
@@ -212,41 +211,9 @@ struct BasicAdjustmentsSection: View {
         InspectorSection(title: "Basic Settings", isExpanded: $isExpanded) {
             VStack(spacing: 12) {
                 SliderRow(title: "Exposure", value: $adjustments.exposure, range: -5...5)
-                SliderRow(title: "Contrast", value: $adjustments.contrast, range: 0.7...1.3)
+                SliderRow(title: "Contrast", value: $adjustments.contrast, range: 0.5...1.5)
                 SliderRow(title: "Highlights", value: $adjustments.highlights, range: -2...2)
                 SliderRow(title: "Shadows", value: $adjustments.shadows, range: -2...2)
-            }
-        }
-    }
-}
-
-struct ColorPipelineSection: View {
-    @Binding var adjustments: ColorAdjustments
-    @State private var isExpanded: Bool = false
-
-    var body: some View {
-        InspectorSection(title: "Color Pipeline", isExpanded: $isExpanded) {
-            VStack(spacing: 12) {
-                Picker("Input Space", selection: $adjustments.inputColorSpace) {
-                    ForEach(ColorSpaceProfile.allCases, id: \.self) { profile in
-                        Text(profile.rawValue).tag(profile)
-                    }
-                }
-                .pickerStyle(.menu)
-
-                Picker("Working Space", selection: $adjustments.workingColorSpace) {
-                    ForEach(WorkingColorSpaceProfile.allCases, id: \.self) { profile in
-                        Text(profile.rawValue).tag(profile)
-                    }
-                }
-                .pickerStyle(.menu)
-
-                Picker("Output Space", selection: $adjustments.outputColorSpace) {
-                    ForEach(ColorSpaceProfile.allCases, id: \.self) { profile in
-                        Text(profile.rawValue).tag(profile)
-                    }
-                }
-                .pickerStyle(.menu)
             }
         }
     }
@@ -836,7 +803,6 @@ struct ExportSection: View {
         let selectedFormat = viewModel.exportFormat
         let selectedQuality = viewModel.exportQuality
         let selectedFrameRate = viewModel.exportFrameRate
-        let selectedResolution = viewModel.exportResolution
         guard let destinationURL = presentSavePanel(for: selectedFormat) else {
             return
         }
@@ -850,7 +816,6 @@ struct ExportSection: View {
                     format: selectedFormat,
                     quality: selectedQuality,
                     frameRate: selectedFrameRate,
-                    resolution: selectedResolution,
                     onProgress: { progress in
                         exportProgress = progress
                     }
@@ -961,23 +926,17 @@ private struct ExportSettingsSheet: View {
                     .labelsHidden()
                 }
             )
-            
+
             settingBlock(
-                title: "Resolution",
+                title: "Project Canvas",
                 content: {
-                    Picker(
-                        "",
-                        selection: Binding(
-                            get: { viewModel.exportResolution },
-                            set: { viewModel.exportResolution = $0 }
-                        )
-                    ) {
-                        ForEach(ExportResolution.allCases) { resolution in
-                            Text(resolution.displayName).tag(resolution)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
+                    Text("\(viewModel.projectCanvasDescription) • \(viewModel.projectResolutionDescription)")
+                        .foregroundColor(Theme.textMain)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(Theme.backgroundDark.opacity(0.8))
+                        .cornerRadius(10)
                 }
             )
             

@@ -3,7 +3,7 @@ import AVFoundation
 import UniformTypeIdentifiers
 import CoreGraphics
 
-enum ExportFormat: String, CaseIterable, Identifiable {
+enum ExportFormat: String, CaseIterable, Identifiable, Codable {
     case mp4
     case hevc
     case mov
@@ -50,7 +50,7 @@ enum ExportFormat: String, CaseIterable, Identifiable {
     }
 }
 
-enum ExportQuality: String, CaseIterable, Identifiable {
+enum ExportQuality: String, CaseIterable, Identifiable, Codable {
     case low
     case medium
     case high
@@ -86,7 +86,7 @@ enum ExportQuality: String, CaseIterable, Identifiable {
     }
 }
 
-enum ExportFrameRate: Int, CaseIterable, Identifiable {
+enum ExportFrameRate: Int, CaseIterable, Identifiable, Codable {
     case fps30 = 30
     case fps60 = 60
 
@@ -94,29 +94,6 @@ enum ExportFrameRate: Int, CaseIterable, Identifiable {
 
     var displayName: String {
         "\(rawValue) fps"
-    }
-}
-
-enum ExportResolution: String, CaseIterable, Identifiable {
-    case fullHD
-    case uhd4k
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .fullHD: return "1080p (1920x1080)"
-        case .uhd4k: return "4K UHD (3840x2160)"
-        }
-    }
-
-    var size: CGSize {
-        switch self {
-        case .fullHD:
-            return CGSize(width: 1920, height: 1080)
-        case .uhd4k:
-            return CGSize(width: 3840, height: 2160)
-        }
     }
 }
 

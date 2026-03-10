@@ -2,6 +2,8 @@ import Foundation
 import CoreImage
 import AVFoundation
 import CoreGraphics
+import CoreVideo
+import Metal
 
 nonisolated enum ColorPipelineRenderQuality {
     case preview
@@ -12,12 +14,47 @@ nonisolated class CoreImageProcessor {
     static let shared = CoreImageProcessor()
 
     private struct ContextKey: Hashable {
-        let working: WorkingColorSpaceProfile
-        let output: ColorSpaceProfile
+        let working: ColorSpace
+        let output: ColorSpace
+    }
+
+    private struct RawPixelBufferPoolKey: Hashable {
+        let width: Int
+        let height: Int
+    }
+
+    private struct ColorPipelineConfiguration {
+        let working: ColorSpace
+        let output: ColorSpace
+    }
+
+    private enum LUTPipelineError: Error, CustomStringConvertible {
+        case missingCreativeLUTSpace
+        case missingTechnicalLUTSpaces
+        case unsupportedSourceToWorkingTransform(SignalSpace, ColorSpace)
+        case unsupportedSourceToLUTTransform(SignalSpace, SignalSpace)
+        case unsupportedLUTOutputToWorkingTransform(SignalSpace, ColorSpace)
+
+        var description: String {
+            switch self {
+            case .missingCreativeLUTSpace:
+                return "Creative LUT is missing an explicit LUT space."
+            case .missingTechnicalLUTSpaces:
+                return "Technical LUT is missing explicit input/output spaces."
+            case let .unsupportedSourceToWorkingTransform(source, working):
+                return "Missing explicit transform from \(source.displayName) to working space \(working.rawValue)."
+            case let .unsupportedSourceToLUTTransform(source, lutInput):
+                return "Missing explicit transform from \(source.displayName) to LUT input space \(lutInput.displayName)."
+            case let .unsupportedLUTOutputToWorkingTransform(lutOutput, working):
+                return "Missing explicit transform from LUT output space \(lutOutput.displayName) to working space \(working.rawValue)."
+            }
+        }
     }
 
     private var contextCache: [ContextKey: CIContext] = [:]
     private let contextCacheQueue = DispatchQueue(label: "CoreImageProcessor.contextCacheQueue")
+    private let metalDevice = MTLCreateSystemDefaultDevice()
+    private var rawPixelBufferPools: [RawPixelBufferPoolKey: CVPixelBufferPool] = [:]
 
     private let noiseReductionFilter = CIFilter(name: "CINoiseReduction")
     private let sharpenFilter = CIFilter(name: "CISharpenLuminance")
@@ -26,35 +63,211 @@ nonisolated class CoreImageProcessor {
     private let vignetteDarkenFilter = CIFilter(name: "CIColorMatrix")
     private let vignetteBlendFilter = CIFilter(name: "CIBlendWithMask")
     private let gaussianBlurFilter = CIFilter(name: "CIGaussianBlur")
+    private let primaryToneKernel = CIColorKernel(source: """
+float smoothstep_ci(float edge0, float edge1, float x) {
+    float t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - (2.0 * t));
+}
+
+float encoded_perceptual_luma(float y) {
+    float scaled = max(y, 0.0) * 15.0;
+    return log2(1.0 + scaled) / 4.0;
+}
+
+float decoded_perceptual_luma(float tone) {
+    return (pow(16.0, tone) - 1.0) / 15.0;
+}
+
+float compress_highlights(float y, float start, float strength) {
+    if (y <= start) {
+        return y;
+    }
+
+    float x = y - start;
+    float k = 1.0 + (strength * 8.0);
+    return start + (x / (1.0 + (k * x)));
+}
+
+vec3 remap_luma(vec3 rgb, float sourceLuma, float targetLuma) {
+    float safeTarget = max(targetLuma, 0.0);
+    float safeSource = max(sourceLuma, 1.0e-6);
+    vec3 scaled = rgb * (safeTarget / safeSource);
+
+    if (sourceLuma <= 1.0e-4) {
+        vec3 neutral = vec3(safeTarget);
+        float blend = smoothstep_ci(0.0, 1.0e-4, sourceLuma);
+        return vec3(
+            neutral.r + ((scaled.r - neutral.r) * blend),
+            neutral.g + ((scaled.g - neutral.g) * blend),
+            neutral.b + ((scaled.b - neutral.b) * blend)
+        );
+    }
+
+    return scaled;
+}
+
+kernel vec4 primaryTone(
+    __sample image,
+    float exposureValue,
+    float contrastValue,
+    float highlightsValue,
+    float shadowsValue,
+    float filmicValue,
+    vec3 coefficients
+) {
+    float exposureScale = pow(2.0, exposureValue);
+    vec3 rgb = image.rgb * exposureScale;
+    float sourceLuma = max(dot(rgb, coefficients), 0.0);
+    float tone = encoded_perceptual_luma(sourceLuma);
+    float pivot = encoded_perceptual_luma(0.18);
+    float contrastSlope = pow(max(0.01, contrastValue), 1.2);
+
+    if (abs(contrastValue - 1.0) > 1.0e-6) {
+        tone = pivot + ((tone - pivot) * contrastSlope);
+    }
+
+    float shadowAmount = clamp(shadowsValue / 2.0, -1.0, 1.0);
+    float highlightAmount = clamp(highlightsValue / 2.0, -1.0, 1.0);
+    float shadowMask = 1.0 - smoothstep_ci(0.16, 0.60, tone);
+    float highlightMask = smoothstep_ci(0.40, 0.92, tone);
+
+    if (abs(shadowAmount) > 1.0e-6) {
+        float strength = shadowAmount >= 0.0 ? 0.18 : 0.16;
+        tone += shadowAmount * strength * pow(shadowMask, 1.2);
+    }
+
+    if (abs(highlightAmount) > 1.0e-6) {
+        float strength = highlightAmount >= 0.0 ? 0.15 : 0.20;
+        tone += highlightAmount * strength * pow(highlightMask, 1.05);
+    }
+
+    float targetLuma = decoded_perceptual_luma(tone);
+    if (highlightAmount > 1.0e-6) {
+        float extended = targetLuma * (1.0 + (0.35 * highlightAmount));
+        float compressedHighlights = compress_highlights(extended, 0.82, 0.45 * highlightAmount);
+        targetLuma = mix(targetLuma, compressedHighlights, highlightMask);
+    } else if (highlightAmount < -1.0e-6) {
+        float recovered = compress_highlights(targetLuma, 0.34, abs(highlightAmount) * 2.8);
+        targetLuma = mix(targetLuma, recovered, highlightMask);
+    }
+
+    float filmicStrength = clamp(filmicValue, 0.0, 2.5);
+    if (filmicStrength > 1.0e-6) {
+        targetLuma = compress_highlights(max(targetLuma, 0.0), 0.64, filmicStrength);
+    }
+
+    vec3 resultRGB = remap_luma(rgb, sourceLuma, targetLuma);
+    return vec4(resultRGB, image.a);
+}
+""")
     private let processingQueue = DispatchQueue(label: "CoreImageProcessor.processingQueue")
+    private let rawPassthroughContext: CIContext
+
+    private init() {
+        let options: [CIContextOption: Any] = [
+            .cacheIntermediates: false,
+            .workingColorSpace: NSNull(),
+            .outputColorSpace: NSNull()
+        ]
+
+        if let metalDevice {
+            rawPassthroughContext = CIContext(mtlDevice: metalDevice, options: options)
+        } else {
+            rawPassthroughContext = CIContext(options: options)
+        }
+    }
 
     func applyAdjustments(
         _ adjustments: ColorAdjustments,
         lutURL: URL? = nil,
+        sourceSignalSpace: SignalSpace? = nil,
         timeSeconds: Double? = nil,
         renderQuality: ColorPipelineRenderQuality = .preview,
         to image: CIImage
     ) -> CIImage {
         processingQueue.sync {
             _ = timeSeconds
-            _ = managedContext(
-                working: adjustments.workingColorSpace,
-                output: adjustments.outputColorSpace
-            )
+            _ = sourceSignalSpace
+            let pipeline = colorPipeline(for: adjustments)
+            _ = managedContext(working: pipeline.working, output: pipeline.output)
+            let resolvedSourceSignalSpace: SignalSpace = .rec709
+            let normalizedSourceImage = image
+            let importedDescriptor = lutURL.map { ImportedLUTManager.shared.descriptor(for: $0) }
+            let baseWorkingSourceSignalSpace = resolvedSourceSignalSpace
 
-            var currentImage = image
+            let baseWorkingImage: CIImage? = {
+                return convertSourceImageToWorkingSpace(
+                    normalizedSourceImage,
+                    sourceSignalSpace: resolvedSourceSignalSpace,
+                    workingSpace: pipeline.working
+                )
+            }()
 
-            if let lutURL,
-               let imported = ImportedLUTManager.shared.applyCube(at: lutURL, to: currentImage) {
-                currentImage = imported
+            var currentImage = baseWorkingImage
+            var appliedPrimaryTonePreTechnicalLUT = false
+            if let lutURL, let descriptor = importedDescriptor {
+                if descriptor.role == .technicalTransform,
+                   adjustments.hasDirectPrimaryToneAdjustments,
+                   let baseWorkingImage {
+                    let preLUTWorkingImage = applyDirectPrimaryToneControls(
+                        baseWorkingImage,
+                        adjustments: adjustments,
+                        workingSpace: pipeline.working
+                    )
+
+                    switch applyTechnicalImportedLUT(
+                        workingImage: preLUTWorkingImage,
+                        descriptor: descriptor,
+                        workingSpace: pipeline.working,
+                        lutURL: lutURL
+                    ) {
+                    case let .success(lutWorkingImage):
+                        currentImage = lutWorkingImage
+                        appliedPrimaryTonePreTechnicalLUT = true
+                    case let .failure(error):
+                        logLUTPipelineError(error, lutURL: lutURL)
+                    }
+                }
+
+                if !appliedPrimaryTonePreTechnicalLUT {
+                    switch applyImportedLUT(
+                        sourceImage: normalizedSourceImage,
+                        sourceSignalSpace: resolvedSourceSignalSpace,
+                        descriptor: descriptor,
+                        workingSpace: pipeline.working,
+                        lutURL: lutURL
+                    ) {
+                    case let .success(lutWorkingImage):
+                        currentImage = lutWorkingImage
+                    case let .failure(error):
+                        logLUTPipelineError(error, lutURL: lutURL)
+                    }
+                }
+            }
+
+            guard var currentImage else {
+                logSourcePipelineError(
+                    sourceSignalSpace: baseWorkingSourceSignalSpace,
+                    workingSpace: pipeline.working
+                )
+                return image
             }
 
             let cubeDimension = lutDimension(for: renderQuality, extent: image.extent)
-            if let lutFilter = LUTGenerator.shared.filter(for: adjustments, dimension: cubeDimension) {
+            let generatedLUTAdjustments = adjustments.generatedLUTAdjustments
+            if let lutFilter = LUTGenerator.shared.filter(for: generatedLUTAdjustments, dimension: cubeDimension) {
                 lutFilter.setValue(currentImage, forKey: kCIInputImageKey)
                 if let out = lutFilter.outputImage {
                     currentImage = out
                 }
+            }
+
+            if !appliedPrimaryTonePreTechnicalLUT {
+                currentImage = applyDirectPrimaryToneControls(
+                    currentImage,
+                    adjustments: adjustments,
+                    workingSpace: pipeline.working
+                )
             }
 
             if adjustments.clarity > 0.001 {
@@ -115,27 +328,90 @@ nonisolated class CoreImageProcessor {
                 }
             }
 
-            return currentImage
+            return convertWorkingImageToOutputSpace(
+                currentImage,
+                workingSpace: pipeline.working,
+                outputSpace: pipeline.output
+            ) ?? currentImage
         }
     }
 
-    private func managedContext(
-        working: WorkingColorSpaceProfile,
-        output: ColorSpaceProfile
-    ) -> CIContext {
+    func applyLUT(
+        image: CIImage,
+        lutURL: URL,
+        inputSpace: ColorSpace,
+        workingSpace: ColorSpace,
+        outputSpace: ColorSpace
+    ) -> CIImage {
+        processingQueue.sync {
+            _ = managedContext(working: workingSpace, output: outputSpace)
+            let descriptor = ImportedLUTManager.shared.descriptor(for: lutURL)
+            let resolvedSourceSignalSpace: SignalSpace = .rec709
+            let normalizedSourceImage = image
+
+            switch applyImportedLUT(
+                sourceImage: normalizedSourceImage,
+                sourceSignalSpace: resolvedSourceSignalSpace,
+                descriptor: descriptor,
+                workingSpace: workingSpace,
+                lutURL: lutURL
+            ) {
+            case let .success(lutWorkingImage):
+                return convertWorkingImageToOutputSpace(
+                    lutWorkingImage,
+                    workingSpace: workingSpace,
+                    outputSpace: outputSpace
+                ) ?? lutWorkingImage
+            case let .failure(error):
+                logLUTPipelineError(error, lutURL: lutURL)
+                guard let workingImage = convertSourceImageToWorkingSpace(
+                    normalizedSourceImage,
+                    sourceSignalSpace: resolvedSourceSignalSpace,
+                    workingSpace: workingSpace
+                ) else {
+                    logSourcePipelineError(
+                        sourceSignalSpace: resolvedSourceSignalSpace,
+                        workingSpace: workingSpace
+                    )
+                    return image
+                }
+                return convertWorkingImageToOutputSpace(
+                    workingImage,
+                    workingSpace: workingSpace,
+                    outputSpace: outputSpace
+                ) ?? workingImage
+            }
+        }
+    }
+
+    func renderContext(for adjustments: ColorAdjustments) -> CIContext {
+        _ = adjustments
+        return managedContext(working: .linearSRGB, output: .rec709)
+    }
+
+    func renderContext(workingSpace: ColorSpace, outputSpace: ColorSpace) -> CIContext {
+        managedContext(working: workingSpace, output: outputSpace)
+    }
+
+    private func managedContext(working: ColorSpace, output: ColorSpace) -> CIContext {
         let key = ContextKey(working: working, output: output)
         if let cached = contextCacheQueue.sync(execute: { contextCache[key] }) {
             return cached
         }
 
-        let workingColorSpace = cgWorkingColorSpace(for: working) ?? CGColorSpace(name: CGColorSpace.linearSRGB)
-        let outputColorSpace = cgOutputColorSpace(for: output) ?? CGColorSpace(name: CGColorSpace.itur_709)
-
-        let context = CIContext(options: [
+        let workingColorSpace = working.cgColorSpace ?? CGColorSpace(name: CGColorSpace.linearSRGB)
+        let outputColorSpace = output.cgColorSpace ?? CGColorSpace(name: CGColorSpace.itur_709)
+        let options: [CIContextOption: Any] = [
             .cacheIntermediates: false,
             .workingColorSpace: workingColorSpace as Any,
             .outputColorSpace: outputColorSpace as Any
-        ])
+        ]
+        let context: CIContext
+        if let metalDevice {
+            context = CIContext(mtlDevice: metalDevice, options: options)
+        } else {
+            context = CIContext(options: options)
+        }
 
         contextCacheQueue.sync {
             contextCache[key] = context
@@ -143,24 +419,227 @@ nonisolated class CoreImageProcessor {
         return context
     }
 
-    private func cgWorkingColorSpace(for profile: WorkingColorSpaceProfile) -> CGColorSpace? {
-        switch profile {
-        case .linearSRGB:
-            return CGColorSpace(name: CGColorSpace.linearSRGB)
-        case .acescg:
-            return CGColorSpace(name: CGColorSpace.acescgLinear)
+    private func colorPipeline(for adjustments: ColorAdjustments) -> ColorPipelineConfiguration {
+        _ = adjustments
+        return ColorPipelineConfiguration(working: .linearSRGB, output: .rec709)
+    }
+
+    private func convertSourceImageToWorkingSpace(
+        _ image: CIImage,
+        sourceSignalSpace: SignalSpace,
+        workingSpace: ColorSpace
+    ) -> CIImage? {
+        let inputTransform = InputTransform(source: sourceSignalSpace, destinationWorkingSpace: SignalSpace(workingSpace))
+        return inputTransform.process(image)
+    }
+
+    private func applyImportedLUT(
+        sourceImage: CIImage,
+        sourceSignalSpace: SignalSpace,
+        descriptor: ImportedLUTDescriptor,
+        workingSpace: ColorSpace,
+        lutURL: URL
+    ) -> Result<CIImage, LUTPipelineError> {
+        switch descriptor.role {
+        case .creative:
+            return applyCreativeImportedLUT(
+                sourceImage: sourceImage,
+                sourceSignalSpace: sourceSignalSpace,
+                descriptor: descriptor,
+                workingSpace: workingSpace,
+                lutURL: lutURL
+            )
+        case .technicalTransform:
+            return applyTechnicalImportedLUT(
+                sourceImage: sourceImage,
+                sourceSignalSpace: sourceSignalSpace,
+                descriptor: descriptor,
+                workingSpace: workingSpace,
+                lutURL: lutURL
+            )
         }
     }
 
-    private func cgOutputColorSpace(for profile: ColorSpaceProfile) -> CGColorSpace? {
-        switch profile {
-        case .rec709:
-            return CGColorSpace(name: CGColorSpace.itur_709)
-        case .displayP3:
-            return CGColorSpace(name: CGColorSpace.displayP3)
-        case .bt2020:
-            return CGColorSpace(name: CGColorSpace.itur_2020)
+    private func applyCreativeImportedLUT(
+        sourceImage: CIImage,
+        sourceSignalSpace: SignalSpace,
+        descriptor: ImportedLUTDescriptor,
+        workingSpace: ColorSpace,
+        lutURL: URL
+    ) -> Result<CIImage, LUTPipelineError> {
+        guard let lutSpace = descriptor.creativeLUTSpace else {
+            return .failure(.missingCreativeLUTSpace)
         }
+        let workingSignalSpace = SignalSpace(workingSpace)
+
+        guard let workingImage = convertSourceImageToWorkingSpace(
+            sourceImage,
+            sourceSignalSpace: sourceSignalSpace,
+            workingSpace: workingSpace
+        ) else {
+            return .failure(.unsupportedSourceToWorkingTransform(sourceSignalSpace, workingSpace))
+        }
+
+        let lutInputImage: CIImage
+        if lutSpace == workingSignalSpace {
+            lutInputImage = workingImage
+        } else {
+            let transform = OutputTransform(sourceWorkingSpace: workingSignalSpace, destination: lutSpace)
+            guard let converted = transform.process(workingImage) else {
+                return .failure(.unsupportedSourceToLUTTransform(SignalSpace(workingSpace), lutSpace))
+            }
+            lutInputImage = converted
+        }
+
+        let lutOutput = ImportedLUTManager.shared.applyCube(
+            at: lutURL,
+            to: lutInputImage
+        ) ?? lutInputImage
+
+        if lutSpace == workingSignalSpace {
+            return .success(lutOutput)
+        }
+
+        let transform = InputTransform(source: lutSpace, destinationWorkingSpace: workingSignalSpace)
+        guard let workingResult = transform.process(lutOutput) else {
+            return .failure(.unsupportedLUTOutputToWorkingTransform(lutSpace, workingSpace))
+        }
+
+        return .success(workingResult)
+    }
+
+    private func applyTechnicalImportedLUT(
+        sourceImage: CIImage,
+        sourceSignalSpace: SignalSpace,
+        descriptor: ImportedLUTDescriptor,
+        workingSpace: ColorSpace,
+        lutURL: URL
+    ) -> Result<CIImage, LUTPipelineError> {
+        guard let lutInputSpace = descriptor.inputSignalSpace,
+              let lutOutputSpace = descriptor.outputSignalSpace else {
+            return .failure(.missingTechnicalLUTSpaces)
+        }
+
+        guard let lutInputImage = convertSourceImageToLUTInputSpace(
+            sourceImage,
+            sourceSignalSpace: sourceSignalSpace,
+            lutInputSpace: lutInputSpace,
+            workingSpace: workingSpace
+        ) else {
+            return .failure(.unsupportedSourceToLUTTransform(sourceSignalSpace, lutInputSpace))
+        }
+
+        let lutOutput = ImportedLUTManager.shared.applyCube(
+            at: lutURL,
+            to: lutInputImage
+        ) ?? lutInputImage
+
+        guard let workingResult = convertLUTOutputImageToWorkingSpace(
+            lutOutput,
+            lutOutputSpace: lutOutputSpace,
+            workingSpace: workingSpace
+        ) else {
+            return .failure(.unsupportedLUTOutputToWorkingTransform(lutOutputSpace, workingSpace))
+        }
+
+        return .success(workingResult)
+    }
+
+    private func applyTechnicalImportedLUT(
+        workingImage: CIImage,
+        descriptor: ImportedLUTDescriptor,
+        workingSpace: ColorSpace,
+        lutURL: URL
+    ) -> Result<CIImage, LUTPipelineError> {
+        guard let lutInputSpace = descriptor.inputSignalSpace,
+              let lutOutputSpace = descriptor.outputSignalSpace else {
+            return .failure(.missingTechnicalLUTSpaces)
+        }
+
+        let workingSignalSpace = SignalSpace(workingSpace)
+        let lutInputImage: CIImage
+        if lutInputSpace == workingSignalSpace {
+            lutInputImage = workingImage
+        } else {
+            let transform = OutputTransform(
+                sourceWorkingSpace: workingSignalSpace,
+                destination: lutInputSpace
+            )
+            guard let converted = transform.process(workingImage) else {
+                return .failure(.unsupportedSourceToLUTTransform(workingSignalSpace, lutInputSpace))
+            }
+            lutInputImage = converted
+        }
+
+        let lutOutput = ImportedLUTManager.shared.applyCube(
+            at: lutURL,
+            to: lutInputImage
+        ) ?? lutInputImage
+
+        if lutOutputSpace == workingSignalSpace {
+            return .success(lutOutput)
+        }
+
+        guard let workingResult = convertLUTOutputImageToWorkingSpace(
+            lutOutput,
+            lutOutputSpace: lutOutputSpace,
+            workingSpace: workingSpace
+        ) else {
+            return .failure(.unsupportedLUTOutputToWorkingTransform(lutOutputSpace, workingSpace))
+        }
+
+        return .success(workingResult)
+    }
+
+    private func convertSourceImageToLUTInputSpace(
+        _ image: CIImage,
+        sourceSignalSpace: SignalSpace,
+        lutInputSpace: SignalSpace,
+        workingSpace: ColorSpace
+    ) -> CIImage? {
+        if sourceSignalSpace == lutInputSpace {
+            return image
+        }
+
+        let transform = InputTransform(
+            source: sourceSignalSpace,
+            destinationWorkingSpace: lutInputSpace
+        )
+        return transform.process(image)
+    }
+
+    private func convertLUTOutputImageToWorkingSpace(
+        _ image: CIImage,
+        lutOutputSpace: SignalSpace,
+        workingSpace: ColorSpace
+    ) -> CIImage? {
+        let transform = InputTransform(
+            source: lutOutputSpace,
+            destinationWorkingSpace: SignalSpace(workingSpace)
+        )
+        return transform.process(image)
+    }
+
+    private func convertWorkingImageToOutputSpace(
+        _ image: CIImage,
+        workingSpace: ColorSpace,
+        outputSpace: ColorSpace
+    ) -> CIImage? {
+        let outputTransform = OutputTransform(sourceWorkingSpace: SignalSpace(workingSpace), destination: SignalSpace(outputSpace))
+        return outputTransform.process(image)
+    }
+
+    private func logLUTPipelineError(_ error: LUTPipelineError, lutURL: URL) {
+        print("LUT pipeline skipped '\(lutURL.lastPathComponent)': \(error.description)")
+    }
+
+    private func logSourcePipelineError(
+        sourceSignalSpace: SignalSpace,
+        workingSpace: ColorSpace
+    ) {
+        print(
+            "Color pipeline skipped grading: missing explicit transform from \(sourceSignalSpace.displayName) to working space \(workingSpace.rawValue)."
+        )
     }
 
     private func lutDimension(for quality: ColorPipelineRenderQuality, extent: CGRect) -> Int {
@@ -170,6 +649,129 @@ nonisolated class CoreImageProcessor {
         case .export:
             let maxDimension = max(extent.width, extent.height)
             return maxDimension >= 3000 ? 65 : 33
+        }
+    }
+
+    private func normalizeManagedSourceImageIfNeeded(
+        _ image: CIImage,
+        sourceSignalSpace: SignalSpace
+    ) -> CIImage {
+        guard sourceSignalSpace.definition?.isLogEncoded == true,
+              image.colorSpace != nil,
+              let pixelBuffer = makeRawPixelBuffer(for: image.extent) else {
+            return image
+        }
+
+        rawPassthroughContext.render(
+            image,
+            to: pixelBuffer,
+            bounds: image.extent,
+            colorSpace: nil
+        )
+
+        var rawImage = CIImage(
+            cvPixelBuffer: pixelBuffer,
+            options: [.colorSpace: NSNull()]
+        )
+
+        if image.extent.origin != .zero {
+            rawImage = rawImage.transformed(
+                by: CGAffineTransform(
+                    translationX: image.extent.origin.x,
+                    y: image.extent.origin.y
+                )
+            )
+        }
+
+        return rawImage.cropped(to: image.extent)
+    }
+
+    private func makeRawPixelBuffer(for extent: CGRect) -> CVPixelBuffer? {
+        let key = RawPixelBufferPoolKey(
+            width: max(Int(extent.width.rounded(.up)), 1),
+            height: max(Int(extent.height.rounded(.up)), 1)
+        )
+
+        let pool: CVPixelBufferPool
+        if let cached = rawPixelBufferPools[key] {
+            pool = cached
+        } else {
+            let poolAttributes: [String: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 3
+            ]
+            let pixelBufferAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_64RGBAHalf),
+                kCVPixelBufferWidthKey as String: key.width,
+                kCVPixelBufferHeightKey as String: key.height,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferCGImageCompatibilityKey as String: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+
+            var createdPool: CVPixelBufferPool?
+            let status = CVPixelBufferPoolCreate(
+                kCFAllocatorDefault,
+                poolAttributes as CFDictionary,
+                pixelBufferAttributes as CFDictionary,
+                &createdPool
+            )
+
+            guard status == kCVReturnSuccess, let createdPool else {
+                return nil
+            }
+
+            rawPixelBufferPools[key] = createdPool
+            pool = createdPool
+        }
+
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(
+            kCFAllocatorDefault,
+            pool,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess else {
+            return nil
+        }
+
+        return pixelBuffer
+    }
+
+    private func applyDirectPrimaryToneControls(
+        _ image: CIImage,
+        adjustments: ColorAdjustments,
+        workingSpace: ColorSpace
+    ) -> CIImage {
+        guard adjustments.hasDirectPrimaryToneAdjustments,
+              let primaryToneKernel else {
+            return image
+        }
+
+        let coefficients = lumaCoefficients(for: workingSpace)
+        let arguments: [Any] = [
+            image,
+            adjustments.exposure,
+            adjustments.contrast,
+            adjustments.highlights,
+            adjustments.shadows,
+            adjustments.filmicHighlightRolloff,
+            CIVector(x: coefficients.red, y: coefficients.green, z: coefficients.blue)
+        ]
+
+        return primaryToneKernel.apply(extent: image.extent, arguments: arguments) ?? image
+    }
+
+    private func lumaCoefficients(for workingSpace: ColorSpace) -> (red: Double, green: Double, blue: Double) {
+        switch workingSpace {
+        case .displayP3:
+            return (0.22897456, 0.69173852, 0.07928691)
+        case .bt2020:
+            return (0.26270021, 0.67799807, 0.05930172)
+        case .acescg:
+            return (0.27222872, 0.67408177, 0.05368952)
+        case .rec709, .linearSRGB:
+            return (0.2126729, 0.7151522, 0.0721750)
         }
     }
 

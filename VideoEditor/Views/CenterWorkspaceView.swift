@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreMedia
 import AppKit
+import QuartzCore
 
 private let clipEditorTrimCoordinateSpace = "ClipEditorTrimCoordinateSpace"
 
@@ -62,12 +63,18 @@ struct LivePreviewView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.horizontal, 6)
-                
-                Button(action: toggleCanvasOrientation) {
+
+                HStack(spacing: 6) {
                     Image(systemName: viewModel.canvasOrientation.previewSymbolName)
-                        .foregroundColor(Theme.accentPink)
+                    Text(viewModel.canvasOrientation.shortLabel)
+                        .font(.caption.weight(.semibold))
                 }
-                .buttonStyle(.plain)
+                .foregroundColor(Theme.accentPink)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Theme.backgroundDark.opacity(0.85))
+                .cornerRadius(8)
+                .help("Project canvas is fixed for the whole project: \(viewModel.canvasOrientation.displayName)")
                 
                 Button(action: toggleCropMode) {
                     Image(systemName: "crop")
@@ -78,6 +85,18 @@ struct LivePreviewView: View {
                 .disabled(!hasActivePreviewClip || viewModel.isMovieTimelinePreviewActive)
 
                 if cropModeEnabled {
+                    Button(action: zoomOutCrop) {
+                        Image(systemName: "minus")
+                            .foregroundColor(Theme.textMain)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: zoomInCrop) {
+                        Image(systemName: "plus")
+                            .foregroundColor(Theme.textMain)
+                    }
+                    .buttonStyle(.plain)
+
                     Button("Cancel", action: cancelCropEditing)
                         .buttonStyle(.plain)
                         .foregroundColor(Theme.textSecondary)
@@ -107,7 +126,7 @@ struct LivePreviewView: View {
 
                         ZStack(alignment: .center) {
                             PreviewCanvasPlayer(
-                                player: viewModel.engine.player,
+                                engine: viewModel.engine,
                                 canvasSize: canvasSize,
                                 sourceAspectRatio: sourceAspectRatio,
                                 cropRect: effectiveCropRect
@@ -139,8 +158,8 @@ struct LivePreviewView: View {
             }
         }
         .background(Color(white: 0.1))
-        .onChange(of: viewModel.activePreviewClipID) { _, newValue in
-            if newValue == nil {
+        .onChange(of: viewModel.activePreviewClipID) { oldValue, newValue in
+            if newValue != oldValue {
                 cropModeEnabled = false
                 pendingCropRect = nil
             }
@@ -175,13 +194,8 @@ struct LivePreviewView: View {
         }
     }
 
-    private func toggleCanvasOrientation() {
-        viewModel.toggleCanvasOrientation()
-    }
-
     private func applyCropEditing() {
-        let crop = effectiveCropRect(sourceAspectRatio: viewModel.previewSourceAspectRatio)
-        viewModel.setActivePreviewCropRect(crop)
+        viewModel.setActivePreviewCropRect(pendingCropRect)
         cropModeEnabled = false
         pendingCropRect = nil
     }
@@ -189,6 +203,21 @@ struct LivePreviewView: View {
     private func cancelCropEditing() {
         cropModeEnabled = false
         pendingCropRect = nil
+    }
+
+    private func zoomInCrop() {
+        adjustCropZoom(scaleFactor: 0.88)
+    }
+
+    private func zoomOutCrop() {
+        adjustCropZoom(scaleFactor: 1.12)
+    }
+
+    private func adjustCropZoom(scaleFactor: CGFloat) {
+        guard cropModeEnabled else { return }
+        let sourceAspectRatio = viewModel.previewSourceAspectRatio
+        let current = effectiveCropRect(sourceAspectRatio: sourceAspectRatio)
+        pendingCropRect = scaledCropRect(current, scaleFactor: scaleFactor, sourceAspectRatio: sourceAspectRatio)
     }
 
     private func fittedCanvasSize(in availableSize: CGSize, aspectRatio: CGFloat) -> CGSize {
@@ -214,33 +243,41 @@ struct LivePreviewView: View {
             canvasAspect: viewModel.canvasAspectRatio
         )
     }
+
+    private func scaledCropRect(_ rect: CGRect, scaleFactor: CGFloat, sourceAspectRatio: CGFloat) -> CGRect {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let scaled = CGRect(
+            x: center.x - ((rect.width * scaleFactor) * 0.5),
+            y: center.y - ((rect.height * scaleFactor) * 0.5),
+            width: rect.width * scaleFactor,
+            height: rect.height * scaleFactor
+        )
+        return fittedCropRect(currentRect: scaled, sourceAspectRatio: sourceAspectRatio)
+    }
 }
 
 private struct PreviewCanvasPlayer: View {
-    let player: AVPlayer
+    let engine: VideoPlaybackEngine
     let canvasSize: CGSize
     let sourceAspectRatio: CGFloat
     let cropRect: CGRect
 
     var body: some View {
-        let sourceWidth = max(sourceAspectRatio, 0.001)
-        let cropWidth = max(cropRect.width * sourceWidth, 0.001)
-        let cropHeight = max(cropRect.height, 0.001)
-        let scale = min(canvasSize.width / cropWidth, canvasSize.height / cropHeight)
-        let fullWidth = sourceWidth * scale
-        let fullHeight = scale
-        let offsetX = -(cropRect.minX * sourceWidth * scale)
-        let offsetY = -(cropRect.minY * scale)
+        let presentation = CanvasCropMath.presentation(
+            for: cropRect,
+            sourceAspect: sourceAspectRatio,
+            canvasSize: canvasSize
+        )
 
         return ZStack(alignment: .topLeading) {
-            PreviewPlayerLayerView(player: player)
-                .frame(width: fullWidth, height: fullHeight)
-                .offset(x: offsetX, y: offsetY)
+            PreviewFrameView(engine: engine)
+                .frame(width: presentation.contentSize.width, height: presentation.contentSize.height)
+                .offset(x: presentation.offset.width, y: presentation.offset.height)
         }
         .frame(width: canvasSize.width, height: canvasSize.height)
         .background(Color.black)
-            .clipped()
-            .contentShape(Rectangle())
+        .clipped()
+        .contentShape(Rectangle())
     }
 }
 
@@ -349,7 +386,7 @@ private struct PreviewCropPanOverlay: View {
         VStack {
             Spacer()
 
-            Text("Drag inside preview to position. Drag corners to zoom. Enter applies crop.")
+            Text("Drag inside preview to position. Drag corners or use +/- to zoom. Enter applies crop.")
                 .font(.caption2.weight(.medium))
                 .foregroundColor(.white.opacity(0.92))
                 .padding(.horizontal, 10)
@@ -400,12 +437,13 @@ private struct PreviewCropPanOverlay: View {
     }
 
     private func updatedRect(for session: PreviewCropPanSession, translation: CGSize) -> CGRect {
-        let sourceWidth = max(sourceAspectRatio, 0.001)
-        let cropWidth = max(session.initialRect.width * sourceWidth, 0.001)
-        let cropHeight = max(session.initialRect.height, 0.001)
-        let scale = min(canvasSize.width / cropWidth, canvasSize.height / cropHeight)
-        let normalizedDX = translation.width / max(sourceWidth * scale, 0.001)
-        let normalizedDY = translation.height / max(scale, 0.001)
+        let presentation = CanvasCropMath.presentation(
+            for: session.initialRect,
+            sourceAspect: sourceAspectRatio,
+            canvasSize: canvasSize
+        )
+        let normalizedDX = translation.width / max(presentation.contentSize.width, 0.001)
+        let normalizedDY = translation.height / max(presentation.contentSize.height, 0.001)
 
         var moved = session.initialRect
         moved.origin.x = session.initialRect.origin.x - normalizedDX
@@ -458,29 +496,42 @@ private struct PreviewCropPanOverlay: View {
     }
 }
 
-private struct PreviewPlayerLayerView: NSViewRepresentable {
-    let player: AVPlayer
+private struct PreviewFrameView: NSViewRepresentable {
+    let engine: VideoPlaybackEngine
 
-    func makeNSView(context: Context) -> PreviewPlayerNSView {
-        let view = PreviewPlayerNSView()
-        view.playerLayer.player = player
+    func makeNSView(context: Context) -> PreviewFrameNSView {
+        let view = PreviewFrameNSView()
+        view.engine = engine
         return view
     }
 
-    func updateNSView(_ nsView: PreviewPlayerNSView, context: Context) {
-        nsView.playerLayer.player = player
+    func updateNSView(_ nsView: PreviewFrameNSView, context: Context) {
+        nsView.engine = engine
+        nsView.requestImmediateRender()
     }
 }
 
-private final class PreviewPlayerNSView: NSView {
-    let playerLayer = AVPlayerLayer()
+private final class PreviewFrameNSView: NSView {
+    var engine: VideoPlaybackEngine? {
+        didSet {
+            requestImmediateRender()
+        }
+    }
+
+    private let imageLayer = CALayer()
+    private var displayLink: CADisplayLink?
+    private let renderQueue = DispatchQueue(label: "PreviewFrameNSView.renderQueue", qos: .userInteractive)
+    private var isRendering = false
+    private var pendingHostTime: CFTimeInterval?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.masksToBounds = true
-        playerLayer.videoGravity = .resizeAspect
-        layer?.addSublayer(playerLayer)
+        imageLayer.contentsGravity = .resizeAspect
+        imageLayer.magnificationFilter = .trilinear
+        imageLayer.minificationFilter = .trilinear
+        layer?.addSublayer(imageLayer)
     }
 
     required init?(coder: NSCoder) {
@@ -489,7 +540,72 @@ private final class PreviewPlayerNSView: NSView {
 
     override func layout() {
         super.layout()
-        playerLayer.frame = bounds
+        imageLayer.frame = bounds
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateDisplayLink()
+        requestImmediateRender()
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        updateDisplayLink()
+    }
+
+    deinit {
+        displayLink?.invalidate()
+    }
+
+    func requestImmediateRender() {
+        requestRender(hostTime: CACurrentMediaTime())
+    }
+
+    @objc private func displayLinkDidFire(_ displayLink: CADisplayLink) {
+        requestRender(hostTime: displayLink.timestamp + displayLink.duration)
+    }
+
+    private func updateDisplayLink() {
+        guard window != nil, superview != nil else {
+            displayLink?.invalidate()
+            displayLink = nil
+            return
+        }
+
+        guard displayLink == nil else { return }
+        let link = self.displayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    private func requestRender(hostTime: CFTimeInterval) {
+        pendingHostTime = hostTime
+        guard !isRendering else { return }
+
+        isRendering = true
+        renderNextFrame()
+    }
+
+    private func renderNextFrame() {
+        let hostTime = pendingHostTime ?? CACurrentMediaTime()
+        pendingHostTime = nil
+        let engine = self.engine
+
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            let image = engine?.copyPreviewImage(forHostTime: hostTime)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.imageLayer.contents = image
+
+                if self.pendingHostTime != nil {
+                    self.renderNextFrame()
+                } else {
+                    self.isRendering = false
+                }
+            }
+        }
     }
 }
 
@@ -874,6 +990,11 @@ struct ClipEditorSegmentView: View {
             }
         }
         .frame(width: width, height: 72, alignment: .leading)
+        .contextMenu {
+            Button("Delete", role: .destructive) {
+                viewModel.deleteClipEditorSegment(segment.id)
+            }
+        }
         .onDisappear {
             releaseAllCursors()
             if activeMode != nil {
@@ -1263,7 +1384,11 @@ struct MasterTimelineView: View {
                                 lutNameProvider: { viewModel.lutName(for: $0) },
                                 selectionAction: { id in
                                     viewModel.activateMovieTimelinePreview(selecting: id)
-                                }, dropStringAction: { idString, trackId, _ in
+                                },
+                                deleteClipAction: { id in
+                                    viewModel.deleteTimelineClip(id)
+                                },
+                                dropStringAction: { idString, trackId, _ in
                                 if let uuid = UUID(uuidString: idString) {
                                     if let draggedClip = viewModel.draggableClip(for: uuid) {
                                         if track.isAudioOnly && draggedClip.mediaItem.type == .video { return }
@@ -1289,6 +1414,9 @@ struct MasterTimelineView: View {
                                 lutNameProvider: nil,
                                 selectionAction: { id in
                                     viewModel.activateMovieTimelinePreview(selecting: id)
+                                },
+                                deleteClipAction: { id in
+                                    viewModel.deleteTimelineClip(id)
                                 },
                                 dropStringAction: { idString, trackId, _ in
                                 if let uuid = UUID(uuidString: idString) {
@@ -1363,6 +1491,7 @@ struct TimelineTrackRow: View {
     var selectedClipID: UUID?
     var lutNameProvider: ((UUID) -> String?)?
     var selectionAction: ((UUID) -> Void)?
+    var deleteClipAction: ((UUID) -> Void)?
     var dropStringAction: ((String, UUID, UUID?) -> Void)?
     
     @State private var isTargeted = false
@@ -1419,6 +1548,11 @@ struct TimelineTrackRow: View {
                                 )
                                 .onTapGesture {
                                     selectionAction?(clip.id)
+                                }
+                                .contextMenu {
+                                    Button("Delete", role: .destructive) {
+                                        deleteClipAction?(clip.id)
+                                    }
                                 }
                                 .dropDestination(for: String.self) { items, _ in
                                     guard let idString = items.first, !idString.hasPrefix("lut:") else { return false }

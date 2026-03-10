@@ -1,6 +1,11 @@
 import CoreGraphics
 
 nonisolated enum CanvasCropMath {
+    struct CropPresentation {
+        let contentSize: CGSize
+        let offset: CGSize
+    }
+
     static func defaultNormalizedCropRect(sourceAspect: CGFloat, canvasAspect: CGFloat) -> CGRect {
         let safeSourceAspect = max(sourceAspect, 0.001)
         let safeCanvasAspect = max(canvasAspect, 0.001)
@@ -48,5 +53,32 @@ nonisolated enum CanvasCropMath {
         originY = min(max(originY, 0.0), 1.0 - height)
 
         return CGRect(x: originX, y: originY, width: width, height: height)
+    }
+
+    static func presentation(for cropRect: CGRect, sourceAspect: CGFloat, canvasSize: CGSize) -> CropPresentation {
+        let safeCanvasWidth = max(canvasSize.width, 1)
+        let safeCanvasHeight = max(canvasSize.height, 1)
+        let safeSourceAspect = max(sourceAspect, 0.001)
+        let safeCanvasAspect = safeCanvasWidth / safeCanvasHeight
+        let fittedCropRect = fittedNormalizedCropRect(
+            cropRect,
+            sourceAspect: safeSourceAspect,
+            canvasAspect: safeCanvasAspect
+        )
+
+        let normalizedSourceSize = CGSize(width: safeSourceAspect, height: 1.0)
+        let cropWidth = max(fittedCropRect.width * normalizedSourceSize.width, 0.001)
+        let cropHeight = max(fittedCropRect.height, 0.001)
+        let scale = max(safeCanvasWidth / cropWidth, safeCanvasHeight / cropHeight)
+        let contentSize = CGSize(
+            width: normalizedSourceSize.width * scale,
+            height: normalizedSourceSize.height * scale
+        )
+        let offset = CGSize(
+            width: -(fittedCropRect.minX * normalizedSourceSize.width * scale) + ((safeCanvasWidth - (cropWidth * scale)) * 0.5),
+            height: -(fittedCropRect.minY * scale) + ((safeCanvasHeight - (cropHeight * scale)) * 0.5)
+        )
+
+        return CropPresentation(contentSize: contentSize, offset: offset)
     }
 }
